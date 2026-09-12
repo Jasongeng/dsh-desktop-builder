@@ -7,15 +7,25 @@
 发行号** —— 每次 dsh 更新都必须重新产出一个桌面安装包。本仓库不复刻这套壳，只把"重新打包"这件事自动化。
 
 ```
-上游发 tag  →  build.ps1 检出该 tag  →  应用品牌覆盖  →  官方打包流程  →  安装包
+取上游修订  →  锚点式品牌覆盖  →  官方打包流程  →  安装包
 ```
+
+## ⚠️ 默认跟踪 master，不是最新 tag
+
+这是实测踩出来的结论，不是偏好：
+
+- tag `dsh-v0.1.5-rc.2` 上**没有** `package:desktop:win:x64:unsigned` 脚本，也**没有** `DSH_DESKTOP_UNSIGNED`，
+  `win.forceCodeSigning` 硬编码为 `true`。也就是说**从该 tag 出发，未签名构建在物理上不可能**。
+- 未签名支持是 tag 之后才进 master 的；master 领先该 tag **139 个提交**。
+
+所以默认 `-Channel master`。等上游发布包含未签名支持的新 tag 后，可以切到 `-Channel stable`。
 
 ## 前置条件（Windows x64 构建机）
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
 | PowerShell | 5.1+ | Windows 自带即可，**不需要** PowerShell 7 |
-| Node.js | `^22.19 \|\| >=24` | 建议 24 |
+| Node.js | `^22.19 \|\| >=24` | 建议 24；品牌覆盖脚本需要它在 PATH 上 |
 | pnpm | `11.7.0` | 必须与 harness 的 `packageManager` 一致 |
 | Python | 3.x | **不能是 Microsoft Store 的跳转桩**，原生模块编译需要 |
 | Visual Studio Build Tools | C++ 工作负载 | `node-pty` 等原生模块需要 |
@@ -55,28 +65,31 @@ $env:DSH_DESKTOP_PRODUCT_NAME = 'DSH Desktop'    # 可选，默认 DeepSeek Harn
 ## 构建
 
 ```powershell
-# 构建最新的 dsh-v* tag
+# 默认：跟踪 origin/master（含未签名支持）
 ./build.ps1
 
-# 只接受稳定版 tag（跳过 -rc / -alpha）
+# 最新稳定 tag（需要该 tag 已包含未签名支持，否则未签名构建会明确报错）
 ./build.ps1 -Channel stable
 
+# 最新 tag，含 -rc / -alpha
+./build.ps1 -Channel prerelease
+
 # 指定上游修订
-./build.ps1 -Ref dsh-v0.1.5-rc.2
+./build.ps1 -Ref dsh-v0.1.6
 
 # 产出未打包的应用目录，便于排查
 ./build.ps1 -Dir
 
-# 重复构建同一版本
+# 重复构建同一提交
 ./build.ps1 -Force
 ```
 
 一次完整的打包会依次执行仓库构建（`build:official`）、打包 dsh 生产闭包、准备内置 Node.js 和 pnpm、
 裁剪运行时文件、校验完整性，最后交给 electron-builder。首次构建通常需要 30–60 分钟。
 
-打包命令优先复用上游已发布的根命令：签名走 package:desktop:win:x64，未签名走
-package:desktop:win:x64:unsigned。只有 -Dir 组合没有对应的上游根命令，会直接调用
-@deepseek-ai/dsh-desktop 的 package 脚本。
+打包命令优先复用上游已发布的根命令：签名走 `package:desktop:win:x64`，未签名走
+`package:desktop:win:x64:unsigned`。只有 `-Dir` 组合没有对应的上游根命令，会直接调用
+`@deepseek-ai/dsh-desktop` 的 `package` 脚本。
 
 ## 签名与更新
 
@@ -110,50 +123,52 @@ $env:DOWNLOAD_TEST_ORIGIN = 'https://your-host.example.com'   # 只能是 HTTPS 
 <DOWNLOAD_TEST_ORIGIN>/_/harness/desktop/stable/win-x64/<通道>.yml
 ```
 
-`build.ps1` 已经把这个目录结构生成在 `dist/<版本>/feed/` 下，整目录同步到你的 HTTPS 主机即可。
+`build.ps1` 已经把这个目录结构生成在 `dist/<版本>-<commit>/feed/` 下，整目录同步到你的 HTTPS 主机即可。
 通道文件名由版本决定：稳定版是 `latest.yml`，预发布版（如 `0.1.5-rc.2`）是 `rc.yml` —— 以实际产出的
 `.yml` 文件名为准，不要写死。
 
-> 用 `-Channel stable` 构建可以避开预发布通道，客户端只会看到稳定更新。
+> **注意**：`package.json` 的版本号在 master 上不会随提交变化。electron-updater 按版本比较，因此从
+> master 连续构建出的两个包版本号相同，**自动更新不会把它们视为新版本**。需要真正的自动更新时，请用
+> `-Channel stable` 从 tag 构建，或等上游 bump 版本号。
 
 ## 产物
 
 ```
 dist/
-  <上游版本>/                                安装包、.blockmap、更新元数据、build-info.json
-    feed/_/harness/desktop/stable/win-x64/   仅签名构建生成
-  last-build.json                            最近一次构建的摘要，CI 也读这个文件
+  <上游版本>-<commit>/                         安装包、.blockmap、更新元数据、build-info.json
+    feed/_/harness/desktop/stable/win-x64/     仅签名构建生成
+  last-build.json                              最近一次构建的摘要，CI 也读这个文件
 ```
 
-`build-info.json` 记录了上游 tag、commit、打包模式、签名判定原因、appId、productName，便于追溯某个
-安装包到底来自哪次上游提交。
+目录名带 commit 短哈希，是因为同一版本号下 master 的不同提交内容并不相同，只按版本号归档会互相覆盖。
+`build-info.json` 记录了上游 ref、commit、打包模式、签名判定原因、appId、productName。
 
-## 覆盖层维护
+## 品牌覆盖层
 
-`overlay/*.patch` 是**唯一**对上游源码的改动，当前只有品牌相关的两行：
+`overlay/apply-branding.mjs` 是**唯一**对上游源码的改动，只做两处替换：
 
-| 文件 | 改动 |
+| 锚点 | 替换 |
 |---|---|
-| `apps/desktop/electron-builder.config.mjs` | `productName` 读 `DSH_DESKTOP_PRODUCT_NAME`；`win.icon` 读 `DSH_DESKTOP_ICON` |
+| `productName: 'DeepSeek Harness',` | `productName: env.DSH_DESKTOP_PRODUCT_NAME ?? 'DeepSeek Harness',` |
+| `win: {` | 其后插入 `icon: env.DSH_DESKTOP_ICON,` |
 
-`appId` 上游本来就走环境变量，无需补丁。
+`appId` 上游本来就走环境变量，无需覆盖。
 
-上游如果改动了被补丁覆盖的行，`git apply --3way` 会**显式报错并中止**（不会静默产出错误品牌的包）。
-此时重新生成补丁：
+**为什么不用 `.patch` 文件**：第一版用行上下文补丁，结果在 tag 上直接失败 —— 补丁是针对 master 生成的，
+而 tag 上 `win: {` 后面那行是 `forceCodeSigning: true`，master 上已经变成 `forceCodeSigning: !unsigned`。
+上下文对不上就整体失败。改成锚点匹配后，同一份覆盖在 tag 和 master 上都能用（已实测），并且：
 
-```powershell
-# 在 harness/ 中手工应用改动后
-git -C harness diff -- apps/desktop/electron-builder.config.mjs > overlay/0001-branding.patch
-git -C harness checkout -- .
-```
+- 幂等：重复执行不会重复插入；
+- 严格：锚点匹配数不等于 1 就报错退出，**不会静默产出错误品牌的包**；
+- 保留原文件的行尾风格（CRLF 或 LF）。
 
-补丁文件受 `.gitattributes` 的 `overlay/*.patch -text` 保护，永远不会被改成 CRLF —— 否则
-`git apply` 的上下文行会匹配失败。
+上游若删改这两个锚点，`build.ps1` 会在第 2 步明确失败，此时改 `overlay/apply-branding.mjs` 里的
+`pattern` / `replace` 即可。
 
 ## 持续跟进
 
-`.github/workflows/desktop.yml` 每天探测一次上游 `dsh-v*` tag，发现新版本就构建并发布到 GitHub
-Release，已发布过的版本自动跳过。
+`.github/workflows/desktop.yml` 每天探测一次上游 `origin/master`，发现新提交就构建并发布到 GitHub
+Release，已发布过的 `版本-commit` 组合自动跳过。
 
 Hosted runner 接触不到 SafeNet Token，所以 **CI 只能产出 unsigned 安装包**。需要 EV 签名的正式版本必须在
 持有 Token 的 Windows 机器上运行 `build.ps1`。
@@ -164,17 +179,23 @@ Hosted runner 接触不到 SafeNet Token，所以 **CI 只能产出 unsigned 安
 
 `*.ps1` 里的字符串**全部使用 ASCII**，这是刻意的：Windows PowerShell 5.1 会用系统 ANSI 代码页
 （本机为 936/GBK）读取无 BOM 的文件。中文若以 UTF-8 无 BOM 保存，会被误解码成乱码，全角标点甚至可能
-吞掉紧跟的 `$`，直接破坏脚本语法。中文说明放在 Markdown（`README.md`）里，PowerShell 不会去解析它。
+吞掉紧跟的 `$`，直接破坏脚本语法（表现为 `The string is missing the terminator`）。中文说明放在
+Markdown（`README.md`）里，PowerShell 不会去解析它。
 
 `build.ps1` 写出的 JSON 一律为无 BOM 的 UTF-8，避免严格的 JSON 读取方解析失败。
+
+`.gitattributes` 固定了 `* text=auto eol=lf`，并给 `overlay/*.patch` 加了 `-text` —— 如果以后新增
+行上下文补丁，Windows 的 `core.autocrlf` 会把它改成 CRLF 从而让 `git apply` 上下文匹配失败。
 
 ## 故障排查
 
 | 现象 | 原因与处理 |
 |---|---|
+| `overlay patch ... did not apply` | 旧版补丁机制的错误；本仓库已改成锚点覆盖，请确认用的是 `overlay/apply-branding.mjs` |
+| `revision ... does not support unsigned Windows builds` | 该 tag 早于未签名支持。改用 `-Channel master`，或提供 EV 签名输入 |
+| `anchor "..." matched 0 times` | 上游改动了品牌锚点，更新 `overlay/apply-branding.mjs` |
 | `pnpm install` 卡在 Electron 下载 | 设 `ELECTRON_MIRROR` / `npm_config_registry` |
 | 原生模块编译失败 | Python 是 Store 跳转桩，或缺少 VS C++ Build Tools |
-| `overlay patch ... did not apply` | 上游改了被覆盖的行，按"覆盖层维护"重新生成补丁 |
 | `desktop version ... does not match dsh version` | 上游把壳版本和 dsh 版本解绑了；说明设计变了，需要重新评估本仓库 |
 | 签名构建报更新源缺失 | 设置 `DOWNLOAD_TEST_ORIGIN`，或改用 `-Dir` 做本地验证 |
 | `win-x64 requires a Windows x64 build host` | 打包只能在 Windows x64 上跑 |

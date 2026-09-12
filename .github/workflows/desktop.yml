@@ -2,20 +2,14 @@ name: desktop
 
 on:
   schedule:
-    # 每天 03:00 UTC 探测上游新版本。
+    # 每天 03:00 UTC 探测上游新提交。
     - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Upstream revision to build (default: newest dsh-v* tag)'
+        description: 'Upstream revision (default: origin/master)'
         required: false
         type: string
-      channel:
-        description: 'Accepted tag channel'
-        required: false
-        default: any
-        type: choice
-        options: [any, stable]
 
 permissions:
   contents: write
@@ -42,7 +36,7 @@ jobs:
       # Hosted runners have no SafeNet token, so CI never sees the four
       # DSH_DESKTOP_WINDOWS_* inputs and build.ps1 always selects the unsigned path.
       # Signed releases must be produced on the machine that holds the EV token.
-      - name: Detect upstream version
+      - name: Detect upstream revision
         id: detect
         shell: pwsh
         env:
@@ -53,19 +47,14 @@ jobs:
           }
           git -C harness fetch origin --tags --prune --force
           $ref = '${{ inputs.ref }}'
-          if (-not $ref) {
-            $tags = @(git -C harness tag --list 'dsh-v*' --sort=-v:refname)
-            if ('${{ inputs.channel }}' -eq 'stable') {
-              $tags = @($tags | Where-Object { $_ -match '^dsh-v\d+\.\d+\.\d+$' })
-            }
-            if ($tags.Count -eq 0) { throw 'no dsh-v* tag matched the requested channel' }
-            $ref = $tags[0]
-          }
+          if (-not $ref) { $ref = 'origin/master' }
           git -C harness checkout --quiet --detach $ref
           $version = (Get-Content harness/package.json -Raw | ConvertFrom-Json).version
+          $commit = git -C harness rev-parse --short HEAD
           "ref=$ref" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
-          gh release view "dsh-desktop-v$version" *> $null
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          gh release view "dsh-desktop-$version-$commit" *> $null
           "exists=$($LASTEXITCODE -eq 0)" >> $env:GITHUB_OUTPUT
 
       - name: Build installer
@@ -83,7 +72,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $info = Get-Content dist/last-build.json -Raw | ConvertFrom-Json
-          $tag = "dsh-desktop-v$($info.upstreamVersion)"
+          $tag = "dsh-desktop-$($info.upstreamVersion)-$($info.upstreamCommit)"
           $notes = @(
             "Upstream dsh $($info.upstreamVersion) ($($info.upstreamCommit))"
             "Revision: $($info.upstreamRef)"
@@ -91,13 +80,13 @@ jobs:
             "App id: $($info.appId)"
           ) -join "`n"
           gh release create $tag `
-            --title "$($info.productName) $($info.upstreamVersion)" `
+            --title "$($info.productName) $($info.upstreamVersion) ($($info.upstreamCommit))" `
             --notes $notes `
-            "dist/$($info.upstreamVersion)/*"
+            "$($info.outputRoot)/*"
 
       - name: Already released
         if: steps.detect.outputs.exists == 'true'
-        run: Write-Host "dsh-desktop-v${{ steps.detect.outputs.version }} already published; nothing to do."
+        run: Write-Host "dsh-desktop-${{ steps.detect.outputs.version }}-${{ steps.detect.outputs.commit }} already published; nothing to do."
 
       - uses: actions/upload-artifact@v4
         if: steps.detect.outputs.exists != 'true'

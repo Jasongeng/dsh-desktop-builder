@@ -15,17 +15,20 @@
     ANSI code page, which corrupts non-ASCII string literals and can even change how quotes pair up.
 
 .PARAMETER Ref
-    Upstream git revision (tag, branch, or commit). Defaults to the newest dsh-v* tag.
+    Upstream git revision (tag, branch, or commit). Overrides -Channel.
 
 .PARAMETER Channel
-    any (default) accepts prerelease tags such as dsh-v0.1.5-rc.2; stable accepts only
-    dsh-v<major>.<minor>.<patch>.
+    master (default) tracks origin/master. stable picks the newest dsh-v<major>.<minor>.<patch> tag.
+    prerelease picks the newest dsh-v* tag including -rc and -alpha.
+
+    The default is master, not the newest tag, because unsigned Windows packaging needs the
+    DSH_DESKTOP_UNSIGNED support that only landed after the dsh-v0.1.5-rc.2 tag.
 
 .PARAMETER Dir
     Produce an unpacked application directory instead of an installer.
 
 .PARAMETER Force
-    Rebuild even when dist/<version>/ already exists.
+    Rebuild even when the output directory already exists.
 
 .PARAMETER NoInstall
     Skip pnpm install in the harness checkout.
@@ -33,7 +36,7 @@
 [CmdletBinding()]
 param(
     [string]$Ref,
-    [ValidateSet('any', 'stable')][string]$Channel = 'any',
+    [ValidateSet('master', 'stable', 'prerelease')][string]$Channel = 'master',
     [switch]$Dir,
     [switch]$Force,
     [switch]$NoInstall
@@ -50,6 +53,7 @@ $DistRoot = Join-Path $BuilderRoot 'dist'
 $IconSource = Join-Path $BuilderRoot 'branding\icon.ico'
 $HarnessUrl = 'https://github.com/deepseek-ai/deepseek-harness.git'
 $TargetName = 'win-x64'
+$UnsignedScriptName = 'package:desktop:win:x64:unsigned'
 
 function Invoke-Native {
     param(
@@ -77,6 +81,14 @@ function Get-EnvironmentValue {
     return Get-Item -Path "Env:$Name" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Value
 }
 
+function Test-ScriptExists {
+    param(
+        [Parameter(Mandatory = $true)]$Manifest,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    return @($Manifest.scripts.PSObject.Properties | Where-Object { $_.Name -eq $Name }).Count -gt 0
+}
+
 # JSON must be written as UTF-8 without a BOM; a BOM makes strict JSON readers fail.
 function Write-JsonFile {
     param(
@@ -96,10 +108,15 @@ if (-not (Test-Path -LiteralPath (Join-Path $HarnessRoot '.git'))) {
 Invoke-Native -File 'git' -Arguments @('-C', $HarnessRoot, 'fetch', 'origin', '--tags', '--prune', '--force')
 
 if (-not $Ref) {
-    $tags = Get-GitOutput -Arguments @('tag', '--list', 'dsh-v*', '--sort=-v:refname')
-    if ($Channel -eq 'stable') { $tags = @($tags | Where-Object { $_ -match '^dsh-v\d+\.\d+\.\d+$' }) }
-    if ($tags.Count -eq 0) { throw "no dsh-v* tag matched channel '$Channel'" }
-    $Ref = $tags[0]
+    if ($Channel -eq 'master') {
+        $Ref = 'origin/master'
+    }
+    else {
+        $tags = Get-GitOutput -Arguments @('tag', '--list', 'dsh-v*', '--sort=-v:refname')
+        if ($Channel -eq 'stable') { $tags = @($tags | Where-Object { $_ -match '^dsh-v\d+\.\d+\.\d+$' }) }
+        if ($tags.Count -eq 0) { throw "no dsh-v* tag matched channel '$Channel'" }
+        $Ref = $tags[0]
+    }
 }
 Write-Host "revision: $Ref"
 
@@ -108,27 +125,27 @@ Write-Host "revision: $Ref"
 Invoke-Native -File 'git' -Arguments @('-C', $HarnessRoot, 'reset', '--hard', '--quiet')
 Invoke-Native -File 'git' -Arguments @('-C', $HarnessRoot, 'checkout', '--quiet', '--detach', $Ref)
 
-$upstreamVersion = (Get-Content -LiteralPath (Join-Path $HarnessRoot 'package.json') -Raw | ConvertFrom-Json).version
+$manifest = Get-Content -LiteralPath (Join-Path $HarnessRoot 'package.json') -Raw | ConvertFrom-Json
+$upstreamVersion = $manifest.version
+$supportsUnsigned = Test-ScriptExists -Manifest $manifest -Name $UnsignedScriptName
 $commit = (Get-GitOutput -Arguments @('rev-parse', '--short', 'HEAD')) -join ''
 Write-Host "upstream dsh version: $upstreamVersion ($commit)"
 
-$outputRoot = Join-Path $DistRoot $upstreamVersion
+# The upstream version does not change between master commits, so the commit identifies the build.
+$outputRoot = Join-Path $DistRoot "$upstreamVersion-$commit"
 if ((Test-Path -LiteralPath $outputRoot) -and -not $Force) {
-    Write-Host "dist/$upstreamVersion already exists; pass -Force to rebuild" -ForegroundColor Yellow
+    Write-Host "dist/$upstreamVersion-$commit already exists; pass -Force to rebuild" -ForegroundColor Yellow
     return
 }
 
 # ---------------------------------------------------------------------------
 Write-Host '== [2/6] branding overlay ==' -ForegroundColor Cyan
-$patches = @(Get-ChildItem -LiteralPath $OverlayRoot -Filter '*.patch' | Sort-Object Name)
-if ($patches.Count -eq 0) { throw "no overlay patch found in $OverlayRoot" }
-foreach ($patch in $patches) {
-    & git -C $HarnessRoot apply --3way --whitespace=nowarn $patch.FullName
-    if ($LASTEXITCODE -ne 0) {
-        throw "overlay patch $($patch.Name) did not apply: upstream changed the patched lines. Update the patch and retry."
-    }
-    Write-Host "applied $($patch.Name)"
-}
+$overlayScript = Join-Path $OverlayRoot 'apply-branding.mjs'
+if (-not (Test-Path -LiteralPath $overlayScript)) { throw "missing branding overlay script: $overlayScript" }
+Invoke-Native -File 'node' -Arguments @(
+    $overlayScript,
+    (Join-Path $HarnessRoot 'apps\desktop\electron-builder.config.mjs')
+) -WorkingDirectory $HarnessRoot
 
 # ---------------------------------------------------------------------------
 Write-Host '== [3/6] release environment ==' -ForegroundColor Cyan
@@ -193,6 +210,11 @@ else {
     $mode = 'signed'
 }
 
+# Unsigned support landed after the dsh-v0.1.5-rc.2 tag; older revisions can only build signed.
+if ($mode -eq 'unsigned' -and -not $supportsUnsigned) {
+    throw "revision '$Ref' does not support unsigned Windows builds (upstream added $UnsignedScriptName later). Use -Channel master, or supply the four DSH_DESKTOP_WINDOWS_* EV signing inputs."
+}
+
 if ($mode -eq 'signed') {
     if (-not (Get-EnvironmentValue -Name 'DSH_DESKTOP_AUTO_UPDATE_ENV')) {
         $env:DSH_DESKTOP_AUTO_UPDATE_ENV = 'test'
@@ -216,7 +238,7 @@ if (-not $NoInstall) {
 # Prefer the documented, release-qualified root commands. Only the unpacked unsigned combination
 # has no root script, so that one calls the desktop package script directly.
 if (-not $Dir -and $mode -eq 'unsigned') {
-    $packageArguments = @('run', 'package:desktop:win:x64:unsigned')
+    $packageArguments = @('run', $UnsignedScriptName)
 }
 elseif (-not $Dir) {
     $packageArguments = @('run', 'package:desktop:win:x64')
