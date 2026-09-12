@@ -1,0 +1,5 @@
+# Keep every tracked file byte-stable across platforms.
+* text=auto eol=lf
+
+# Overlay patches are matched literally by `git apply`; never rewrite their line endings.
+overlay/*.patch -text
