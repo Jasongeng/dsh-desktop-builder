@@ -139,13 +139,10 @@ if ((Test-Path -LiteralPath $outputRoot) -and -not $Force) {
 }
 
 # ---------------------------------------------------------------------------
-Write-Host '== [2/6] branding overlay ==' -ForegroundColor Cyan
-$overlayScript = Join-Path $OverlayRoot 'apply-branding.mjs'
-if (-not (Test-Path -LiteralPath $overlayScript)) { throw "missing branding overlay script: $overlayScript" }
-Invoke-Native -File 'node' -Arguments @(
-    $overlayScript,
-    (Join-Path $HarnessRoot 'apps\desktop\electron-builder.config.mjs')
-) -WorkingDirectory $HarnessRoot
+Write-Host '== [2/6] source overlay ==' -ForegroundColor Cyan
+$overlayScript = Join-Path $OverlayRoot 'apply-overlay.mjs'
+if (-not (Test-Path -LiteralPath $overlayScript)) { throw "missing overlay script: $overlayScript" }
+Invoke-Native -File 'node' -Arguments @($overlayScript, $HarnessRoot) -WorkingDirectory $HarnessRoot
 
 # ---------------------------------------------------------------------------
 Write-Host '== [3/6] release environment ==' -ForegroundColor Cyan
@@ -161,6 +158,26 @@ if (-not (Get-EnvironmentValue -Name 'DSH_DESKTOP_PRODUCT_NAME')) {
 }
 Write-Host "app id:       $($env:DSH_DESKTOP_APP_ID)"
 Write-Host "product name: $($env:DSH_DESKTOP_PRODUCT_NAME)"
+
+# node-gyp needs a real Python interpreter. On Windows `python` commonly resolves to the Microsoft
+# Store redirector, which cannot run node-gyp, so probe py -3 and export the interpreter it names.
+if (-not (Get-EnvironmentValue -Name 'PYTHON')) {
+    $interpreter = $null
+    if (Get-Command 'py' -ErrorAction SilentlyContinue) {
+        $probe = & py -3 -c "import sys; print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $probe) { $interpreter = ($probe | Select-Object -First 1).Trim() }
+    }
+    if ($interpreter -and (Test-Path -LiteralPath $interpreter)) {
+        $env:PYTHON = $interpreter
+        Write-Host "python:       $interpreter"
+    }
+    else {
+        Write-Warning 'No real Python 3 interpreter found. Set PYTHON; native modules will fail to build otherwise.'
+    }
+}
+if ((Get-EnvironmentValue -Name 'PYTHON') -match '\\WindowsApps\\') {
+    Write-Warning 'PYTHON points at the Microsoft Store redirector, which cannot run node-gyp.'
+}
 
 # The icon copied by a previous build is untracked, so it must be removed explicitly; otherwise
 # deleting branding/icon.ico would silently keep the old artwork.

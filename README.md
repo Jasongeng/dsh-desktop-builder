@@ -143,26 +143,48 @@ dist/
 目录名带 commit 短哈希，是因为同一版本号下 master 的不同提交内容并不相同，只按版本号归档会互相覆盖。
 `build-info.json` 记录了上游 ref、commit、打包模式、签名判定原因、appId、productName。
 
-## 品牌覆盖层
+## 源码覆盖层
 
-`overlay/apply-branding.mjs` 是**唯一**对上游源码的改动，只做两处替换：
+`overlay/apply-overlay.mjs` 是本仓库对上游源码的**全部**改动，共 6 处锚点编辑，作用于 2 个文件：
 
-| 锚点 | 替换 |
-|---|---|
-| `productName: 'DeepSeek Harness',` | `productName: env.DSH_DESKTOP_PRODUCT_NAME ?? 'DeepSeek Harness',` |
-| `win: {` | 其后插入 `icon: env.DSH_DESKTOP_ICON,` |
+| 文件 | 锚点 | 改动 |
+|---|---|---|
+| `apps/desktop/electron-builder.config.mjs` | `productName: 'DeepSeek Harness',` | 改为读 `DSH_DESKTOP_PRODUCT_NAME` |
+| `apps/desktop/electron-builder.config.mjs` | `win: {` | 其后插入 `icon: env.DSH_DESKTOP_ICON,` |
+| `apps/desktop/tests/fixtures/runtime-payload-smoke.mjs` | `checkFsExt` 相关 3 处 + `node:fs` import 行 | 删除对 `fs-ext` 的检查 |
 
 `appId` 上游本来就走环境变量，无需覆盖。
 
-**为什么不用 `.patch` 文件**：第一版用行上下文补丁，结果在 tag 上直接失败 —— 补丁是针对 master 生成的，
-而 tag 上 `win: {` 后面那行是 `forceCodeSigning: true`，master 上已经变成 `forceCodeSigning: !unsigned`。
-上下文对不上就整体失败。改成锚点匹配后，同一份覆盖在 tag 和 master 上都能用（已实测），并且：
+### 为什么要删掉 fs-ext 检查
 
-- 幂等：重复执行不会重复插入；
+这是**上游的一个缺陷**，不是本地偏好。时间线：
+
+1. `c58097a826` 引入 `fs-ext`，做会话写锁的 POSIX flock
+2. `d927cbff99`（09-07）新增自研预编译 Node-API flock，
+   `packages/session/session-persistence-jsonl/src/lease.ts` 改为 `@deepseek-ai/node-addon-system/flock`，
+   **`fs-ext` 就此离开依赖图**
+3. `fc7abdcfb5`（09-09，晚了 2 天）新增 `runtime-payload-smoke.mjs`，**却仍然 `require('fs-ext')`**
+
+当前状态下 `fs-ext` 不在 `pnpm-lock.yaml`、不在任何 `package.json`、源码零引用，因此 `prepare:dsh` 的
+这个校验**在任何机器上都不可能通过**，`package:desktop:win:x64` 在 master 上是坏的。本仓库删除该检查，
+让打包继续进行。
+
+> 这是上游问题，建议向 deepseek-harness 提 issue。等上游修复后，删掉 `apply-overlay.mjs` 里对应的三条
+> 编辑即可恢复原样。
+
+### 为什么不用 `.patch` 文件
+
+第一版用行上下文补丁，结果在 tag 上直接失败 —— 补丁是针对 master 生成的，而 tag 上 `win: {` 后面那行是
+`forceCodeSigning: true`，master 上已经变成 `forceCodeSigning: !unsigned`。上下文对不上就整体失败。
+
+锚点匹配现在同时满足：
+
+- 跨版本可用：同一份覆盖在 tag 和 master 上都能用（已实测）；
+- 幂等：重复执行输出 `already applied`；
 - 严格：锚点匹配数不等于 1 就报错退出，**不会静默产出错误品牌的包**；
 - 保留原文件的行尾风格（CRLF 或 LF）。
 
-上游若删改这两个锚点，`build.ps1` 会在第 2 步明确失败，此时改 `overlay/apply-branding.mjs` 里的
+上游若改动任一锚点，`build.ps1` 会在第 2 步明确失败，此时改 `overlay/apply-overlay.mjs` 里的
 `pattern` / `replace` 即可。
 
 ## 持续跟进
