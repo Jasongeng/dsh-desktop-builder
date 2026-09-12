@@ -235,29 +235,20 @@ Write-Host '== [5/6] packaging (builds the whole repository first; expect 30-60 
 if (-not $NoInstall) {
     Invoke-Native -File 'pnpm' -Arguments @('install', '--frozen-lockfile') -WorkingDirectory $HarnessRoot
 }
-# Prefer the documented, release-qualified root commands. Only the unpacked unsigned combination
-# has no root script, so that one calls the desktop package script directly.
-if (-not $Dir -and $mode -eq 'unsigned') {
-    $packageArguments = @('run', $UnsignedScriptName)
-}
-elseif (-not $Dir) {
-    $packageArguments = @('run', 'package:desktop:win:x64')
-}
-else {
-    $packageArguments = @('--filter', '@deepseek-ai/dsh-desktop', 'run', 'package', '--', $TargetName)
-    if ($mode -eq 'unsigned') { $packageArguments += '--unsigned' }
-    $packageArguments += '--dir'
-}
-# Upstream package-target.ts re-invokes pnpm as `node $npm_execpath`, so npm_execpath must name a
-# JavaScript file. pnpm 11 installs a platform binary and points npm_execpath at that .exe, which
-# Node rejects with ERR_UNKNOWN_FILE_EXTENSION. pnpm preserves a pre-set npm_execpath, so point it
-# at the JavaScript entry the workspace ships.
+# Upstream packages the desktop through apps/desktop/scripts/package-target.ts. Its runPnpm helper
+# re-invokes pnpm as `node $npm_execpath`, and pnpm 11 reports a platform .exe there, which Node
+# rejects with ERR_UNKNOWN_FILE_EXTENSION. The root pnpm scripts restore that .exe value, so launch
+# the packaging entry directly with the workspace's JavaScript pnpm entry exported instead.
 $pnpmEntry = Join-Path $HarnessRoot 'apps\desktop\node_modules\pnpm\bin\pnpm.mjs'
-if (Test-Path -LiteralPath $pnpmEntry) {
-    $env:npm_execpath = $pnpmEntry
-    Write-Host "npm_execpath: $pnpmEntry"
+if (-not (Test-Path -LiteralPath $pnpmEntry)) {
+    throw "missing the pnpm JavaScript entry: $pnpmEntry"
 }
-Invoke-Native -File 'pnpm' -Arguments $packageArguments -WorkingDirectory $HarnessRoot
+$env:npm_execpath = $pnpmEntry
+Write-Host "npm_execpath: $pnpmEntry"
+$packageArguments = @('--import', 'tsx/esm', 'apps/desktop/scripts/package-target.ts', $TargetName)
+if ($mode -eq 'unsigned') { $packageArguments += '--unsigned' }
+if ($Dir) { $packageArguments += '--dir' }
+Invoke-Native -File 'node' -Arguments $packageArguments -WorkingDirectory $HarnessRoot
 
 # ---------------------------------------------------------------------------
 Write-Host '== [6/6] collecting artifacts ==' -ForegroundColor Cyan
