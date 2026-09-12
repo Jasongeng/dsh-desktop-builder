@@ -300,7 +300,7 @@ if (-not (Test-Path -LiteralPath $artifactDir)) { throw "expected artifacts at $
 
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 Get-ChildItem -LiteralPath $artifactDir -File |
-    Where-Object { $_.Name -ne 'builder-effective-config.yaml' } |
+    Where-Object { $_.Name -notin @('builder-effective-config.yaml', 'builder-debug.yml') } |
     Copy-Item -Destination $outputRoot -Force
 
 $info = [ordered]@{
