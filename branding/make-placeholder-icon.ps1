@@ -1,4 +1,4 @@
-#requires -Version 7.0
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Write a flat-color 256x256 icon.ico so a branded build can run before final artwork exists.
@@ -24,26 +24,27 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
 $size = 256
-$bitmap = [System.Drawing.Bitmap]::new($size, $size)
+$bitmap = New-Object System.Drawing.Bitmap($size, $size)
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 $png = $null
 try {
     $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
     $graphics.Clear([System.Drawing.Color]::FromArgb(255, 77, 107, 254))
-    $font = [System.Drawing.Font]::new('Segoe UI', 96, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+    $font = New-Object System.Drawing.Font('Segoe UI', 96, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
     try {
-        $format = [System.Drawing.StringFormat]::new()
+        $format = New-Object System.Drawing.StringFormat
         try {
             $format.Alignment = [System.Drawing.StringAlignment]::Center
             $format.LineAlignment = [System.Drawing.StringAlignment]::Center
-            $graphics.DrawString($Text, $font, [System.Drawing.Brushes]::White, [System.Drawing.RectangleF]::new(0, 0, $size, $size), $format)
+            $rect = New-Object System.Drawing.RectangleF(0, 0, $size, $size)
+            $graphics.DrawString($Text, $font, [System.Drawing.Brushes]::White, $rect, $format)
         }
         finally { $format.Dispose() }
     }
     finally { $font.Dispose() }
 
-    $stream = [System.IO.MemoryStream]::new()
+    $stream = New-Object System.IO.MemoryStream
     try {
         $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
         $png = $stream.ToArray()
@@ -56,7 +57,7 @@ finally {
 }
 
 # ICONDIR (6 bytes) followed by one ICONDIRENTRY (16 bytes).
-$header = [byte[]]::new(22)
+$header = New-Object byte[] 22
 $header[2] = 1                  # idType: 1 = icon
 $header[4] = 1                  # idCount
 $header[6] = 0                  # width: 0 encodes 256
@@ -66,7 +67,7 @@ $header[12] = 32                # wBitCount
 [BitConverter]::GetBytes([int]$png.Length).CopyTo($header, 14)
 [BitConverter]::GetBytes([int]22).CopyTo($header, 18)
 
-$buffer = [byte[]]::new($header.Length + $png.Length)
+$buffer = New-Object byte[] ($header.Length + $png.Length)
 $header.CopyTo($buffer, 0)
 $png.CopyTo($buffer, $header.Length)
 [System.IO.File]::WriteAllBytes($Path, $buffer)

@@ -1,29 +1,34 @@
-#requires -Version 7.0
+#requires -Version 5.1
 <#
 .SYNOPSIS
-    从跟踪的上游修订构建 Windows x64 的 DeepSeek Harness 桌面安装包。
+    Build a Windows x64 DeepSeek Harness desktop installer from a tracked upstream revision.
 
 .DESCRIPTION
-    把上游 deepseek-harness 检出到 ./harness，应用品牌覆盖层，然后走官方 apps/desktop 打包路径产出
-    NSIS 安装包。
+    Checks out one upstream deepseek-harness revision into ./harness, applies the branding overlay,
+    and produces an installer through the official apps/desktop packaging path.
 
-    签名模式是自动探测的，不需要手工切换：当四个 DSH_DESKTOP_WINDOWS_* 输入全部存在且有效时，产出
-    EV 签名的发行版并附带 electron-updater 更新元数据；否则产出 unsigned 安装包，且不生成更新源。
+    Signing mode is detected rather than configured. When all four DSH_DESKTOP_WINDOWS_* inputs are
+    present and valid the release is EV-signed and carries electron-updater channel metadata;
+    otherwise an unsigned installer is produced with no update feed.
+
+    Every message is ASCII-only on purpose: Windows PowerShell 5.1 reads a BOM-less file with the
+    ANSI code page, which corrupts non-ASCII string literals and can even change how quotes pair up.
 
 .PARAMETER Ref
-    要构建的上游 git 修订（tag、分支或 commit）。默认为最新的 dsh-v* tag。
+    Upstream git revision (tag, branch, or commit). Defaults to the newest dsh-v* tag.
 
 .PARAMETER Channel
-    any（默认）接受 dsh-v0.1.5-rc.2 这类预发布 tag；stable 只接受 dsh-v<主>.<次>.<修订>。
+    any (default) accepts prerelease tags such as dsh-v0.1.5-rc.2; stable accepts only
+    dsh-v<major>.<minor>.<patch>.
 
 .PARAMETER Dir
-    产出未打包的应用程序目录，而不是安装包。
+    Produce an unpacked application directory instead of an installer.
 
 .PARAMETER Force
-    即使 dist/<版本>/ 已存在也强制重新构建。
+    Rebuild even when dist/<version>/ already exists.
 
 .PARAMETER NoInstall
-    跳过 harness 检出目录中的 pnpm install。
+    Skip pnpm install in the harness checkout.
 #>
 [CmdletBinding()]
 param(
@@ -48,8 +53,8 @@ $TargetName = 'win-x64'
 
 function Invoke-Native {
     param(
-        [Parameter(Mandatory)][string]$File,
-        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$File,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
         [string]$WorkingDirectory = $BuilderRoot
     )
     Push-Location $WorkingDirectory
@@ -61,19 +66,29 @@ function Invoke-Native {
 }
 
 function Get-GitOutput {
-    param([Parameter(Mandatory)][string[]]$Arguments)
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
     $output = & git -C $HarnessRoot @Arguments
     if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') exited with $LASTEXITCODE" }
     return @($output)
 }
 
 function Get-EnvironmentValue {
-    param([Parameter(Mandatory)][string]$Name)
+    param([Parameter(Mandatory = $true)][string]$Name)
     return Get-Item -Path "Env:$Name" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Value
 }
 
+# JSON must be written as UTF-8 without a BOM; a BOM makes strict JSON readers fail.
+function Write-JsonFile {
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $json = $Value | ConvertTo-Json
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 # ---------------------------------------------------------------------------
-Write-Host '== [1/6] 上游检出 ==' -ForegroundColor Cyan
+Write-Host '== [1/6] upstream checkout ==' -ForegroundColor Cyan
 if (-not (Test-Path -LiteralPath (Join-Path $HarnessRoot '.git'))) {
     Write-Host "cloning $HarnessUrl"
     Invoke-Native -File 'git' -Arguments @('clone', '--filter=blob:none', $HarnessUrl, $HarnessRoot)
@@ -83,13 +98,13 @@ Invoke-Native -File 'git' -Arguments @('-C', $HarnessRoot, 'fetch', 'origin', '-
 if (-not $Ref) {
     $tags = Get-GitOutput -Arguments @('tag', '--list', 'dsh-v*', '--sort=-v:refname')
     if ($Channel -eq 'stable') { $tags = @($tags | Where-Object { $_ -match '^dsh-v\d+\.\d+\.\d+$' }) }
-    if ($tags.Count -eq 0) { throw "没有匹配 channel '$Channel' 的 dsh-v* tag" }
+    if ($tags.Count -eq 0) { throw "no dsh-v* tag matched channel '$Channel'" }
     $Ref = $tags[0]
 }
 Write-Host "revision: $Ref"
 
-# 覆盖层会弄脏工作树；每次构建都从干净的固定提交重新开始。这里只重置已跟踪文件，
-# 不执行 git clean，避免误删检出目录中的未跟踪内容。
+# The overlay dirties the work tree; every build restarts from the pinned commit. Only tracked
+# files are reset -- git clean is deliberately avoided so untracked content is never deleted.
 Invoke-Native -File 'git' -Arguments @('-C', $HarnessRoot, 'reset', '--hard', '--quiet')
 Invoke-Native -File 'git' -Arguments @('-C', $HarnessRoot, 'checkout', '--quiet', '--detach', $Ref)
 
@@ -99,30 +114,30 @@ Write-Host "upstream dsh version: $upstreamVersion ($commit)"
 
 $outputRoot = Join-Path $DistRoot $upstreamVersion
 if ((Test-Path -LiteralPath $outputRoot) -and -not $Force) {
-    Write-Host "dist/$upstreamVersion 已存在；加 -Force 可重新构建" -ForegroundColor Yellow
+    Write-Host "dist/$upstreamVersion already exists; pass -Force to rebuild" -ForegroundColor Yellow
     return
 }
 
 # ---------------------------------------------------------------------------
-Write-Host '== [2/6] 品牌覆盖层 ==' -ForegroundColor Cyan
+Write-Host '== [2/6] branding overlay ==' -ForegroundColor Cyan
 $patches = @(Get-ChildItem -LiteralPath $OverlayRoot -Filter '*.patch' | Sort-Object Name)
-if ($patches.Count -eq 0) { throw "在 $OverlayRoot 中找不到任何覆盖补丁" }
+if ($patches.Count -eq 0) { throw "no overlay patch found in $OverlayRoot" }
 foreach ($patch in $patches) {
     & git -C $HarnessRoot apply --3way --whitespace=nowarn $patch.FullName
     if ($LASTEXITCODE -ne 0) {
-        throw "覆盖补丁 $($patch.Name) 应用失败：上游改动了被补丁覆盖的行。请更新该补丁后重试。"
+        throw "overlay patch $($patch.Name) did not apply: upstream changed the patched lines. Update the patch and retry."
     }
     Write-Host "applied $($patch.Name)"
 }
 
 # ---------------------------------------------------------------------------
-Write-Host '== [3/6] 发行环境 ==' -ForegroundColor Cyan
+Write-Host '== [3/6] release environment ==' -ForegroundColor Cyan
 if (-not (Get-EnvironmentValue -Name 'DSH_DESKTOP_APP_ID')) {
     $env:DSH_DESKTOP_APP_ID = 'com.example.dsh-desktop'
-    Write-Warning "未设置 DSH_DESKTOP_APP_ID，暂用 $($env:DSH_DESKTOP_APP_ID)。请改成你自己的反向 DNS 标识。"
+    Write-Warning "DSH_DESKTOP_APP_ID was not set; using $($env:DSH_DESKTOP_APP_ID). Set your own reverse-DNS identifier."
 }
 if ($env:DSH_DESKTOP_APP_ID -notmatch '^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$') {
-    throw 'DSH_DESKTOP_APP_ID 必须是反向 DNS 标识，例如 com.yourorg.dsh'
+    throw 'DSH_DESKTOP_APP_ID must be a reverse-DNS identifier such as com.yourorg.dsh'
 }
 if (-not (Get-EnvironmentValue -Name 'DSH_DESKTOP_PRODUCT_NAME')) {
     $env:DSH_DESKTOP_PRODUCT_NAME = 'DeepSeek Harness'
@@ -130,7 +145,8 @@ if (-not (Get-EnvironmentValue -Name 'DSH_DESKTOP_PRODUCT_NAME')) {
 Write-Host "app id:       $($env:DSH_DESKTOP_APP_ID)"
 Write-Host "product name: $($env:DSH_DESKTOP_PRODUCT_NAME)"
 
-# 上一次构建复制进去的图标不会被 git 跟踪，必须显式清理，否则移除 branding/icon.ico 后仍会沿用旧图标。
+# The icon copied by a previous build is untracked, so it must be removed explicitly; otherwise
+# deleting branding/icon.ico would silently keep the old artwork.
 $iconDir = Join-Path $HarnessRoot 'apps\desktop\build'
 $iconTarget = Join-Path $iconDir 'icon.ico'
 if (Test-Path -LiteralPath $iconTarget) { Remove-Item -LiteralPath $iconTarget -Force }
@@ -143,11 +159,11 @@ if (Test-Path -LiteralPath $IconSource) {
 }
 else {
     Remove-Item Env:\DSH_DESKTOP_ICON -ErrorAction SilentlyContinue
-    Write-Warning '找不到 branding/icon.ico，本次构建沿用 Electron 默认图标。'
+    Write-Warning 'branding/icon.ico not found; this build keeps the stock Electron icon.'
 }
 
 # ---------------------------------------------------------------------------
-Write-Host '== [4/6] 签名模式探测 ==' -ForegroundColor Cyan
+Write-Host '== [4/6] signing mode ==' -ForegroundColor Cyan
 $signingInputs = @(
     'DSH_DESKTOP_WINDOWS_CER_FILE',
     'DSH_DESKTOP_WINDOWS_SIGNTOOL',
@@ -162,16 +178,16 @@ foreach ($name in $signingInputs) {
 $mode = 'unsigned'
 $signingNote = ''
 if ($missing.Count -gt 0) {
-    $signingNote = "未设置：$($missing -join ', ')"
+    $signingNote = "not set: $($missing -join ', ')"
 }
 elseif (-not (Test-Path -LiteralPath $env:DSH_DESKTOP_WINDOWS_CER_FILE)) {
-    $signingNote = "证书文件不存在：$($env:DSH_DESKTOP_WINDOWS_CER_FILE)"
+    $signingNote = "certificate file not found: $($env:DSH_DESKTOP_WINDOWS_CER_FILE)"
 }
 elseif (-not (Test-Path -LiteralPath $env:DSH_DESKTOP_WINDOWS_SIGNTOOL)) {
-    $signingNote = "signtool 不存在：$($env:DSH_DESKTOP_WINDOWS_SIGNTOOL)"
+    $signingNote = "signtool not found: $($env:DSH_DESKTOP_WINDOWS_SIGNTOOL)"
 }
 elseif ($env:DSH_DESKTOP_WINDOWS_TOKEN_PIN -match '[\]"\r\n]') {
-    $signingNote = 'Token PIN 含有不允许的 ]、引号或换行'
+    $signingNote = 'the token PIN contains a forbidden ], quote, or line break'
 }
 else {
     $mode = 'signed'
@@ -183,17 +199,17 @@ if ($mode -eq 'signed') {
     }
     if ($env:DSH_DESKTOP_AUTO_UPDATE_ENV -eq 'test' -and
         [string]::IsNullOrWhiteSpace((Get-EnvironmentValue -Name 'DOWNLOAD_TEST_ORIGIN'))) {
-        throw '签名发行版会写入 electron-updater 更新源。请设置 DOWNLOAD_TEST_ORIGIN 为托管更新源的 HTTPS 源，或设置 DSH_DESKTOP_AUTO_UPDATE_ENV=production。'
+        throw 'A signed release embeds an electron-updater feed. Set DOWNLOAD_TEST_ORIGIN to the HTTPS origin that will host it, or set DSH_DESKTOP_AUTO_UPDATE_ENV=production.'
     }
-    Write-Host "mode: signed (EV)   更新通道: $($env:DSH_DESKTOP_AUTO_UPDATE_ENV)" -ForegroundColor Green
+    Write-Host "mode: signed (EV)   update channel: $($env:DSH_DESKTOP_AUTO_UPDATE_ENV)" -ForegroundColor Green
 }
 else {
-    Write-Host "mode: unsigned      原因: $signingNote" -ForegroundColor Yellow
-    Write-Host '      unsigned 安装包不含更新源，需要手动分发新版本。' -ForegroundColor Yellow
+    Write-Host "mode: unsigned      reason: $signingNote" -ForegroundColor Yellow
+    Write-Host '      An unsigned installer has no update feed and must be redistributed manually.' -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------------------
-Write-Host '== [5/6] 打包（会先完整构建仓库，耗时较长）==' -ForegroundColor Cyan
+Write-Host '== [5/6] packaging (builds the whole repository first; expect 30-60 minutes) ==' -ForegroundColor Cyan
 if (-not $NoInstall) {
     Invoke-Native -File 'pnpm' -Arguments @('install', '--frozen-lockfile') -WorkingDirectory $HarnessRoot
 }
@@ -203,10 +219,10 @@ if ($Dir) { $packageArguments += '--dir' }
 Invoke-Native -File 'pnpm' -Arguments $packageArguments -WorkingDirectory $HarnessRoot
 
 # ---------------------------------------------------------------------------
-Write-Host '== [6/6] 收集产物 ==' -ForegroundColor Cyan
+Write-Host '== [6/6] collecting artifacts ==' -ForegroundColor Cyan
 $targetRoot = Join-Path $HarnessRoot "apps\desktop\.desktop-build\targets\$TargetName"
 $artifactDir = if ($mode -eq 'unsigned') { Join-Path $targetRoot 'unsigned-artifacts' } else { Join-Path $targetRoot 'artifacts' }
-if (-not (Test-Path -LiteralPath $artifactDir)) { throw "预期产物目录不存在：$artifactDir" }
+if (-not (Test-Path -LiteralPath $artifactDir)) { throw "expected artifacts at $artifactDir but the directory does not exist" }
 
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 Get-ChildItem -LiteralPath $artifactDir -File |
@@ -226,8 +242,8 @@ $info = [ordered]@{
     outputRoot      = $outputRoot
     builtAt         = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 }
-$info | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outputRoot 'build-info.json') -Encoding utf8
-$info | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $DistRoot 'last-build.json') -Encoding utf8
+Write-JsonFile -Value $info -Path (Join-Path $outputRoot 'build-info.json')
+Write-JsonFile -Value $info -Path (Join-Path $DistRoot 'last-build.json')
 
 if ($mode -eq 'signed' -and -not $Dir) {
     $feedDir = Join-Path $outputRoot 'feed\_\harness\desktop\stable\win-x64'
@@ -236,12 +252,12 @@ if ($mode -eq 'signed' -and -not $Dir) {
         Where-Object { $_.Extension -in @('.exe', '.yml', '.blockmap') } |
         Copy-Item -Destination $feedDir -Force
     Write-Host ''
-    Write-Host "更新源已就绪：$feedDir" -ForegroundColor Green
-    Write-Host "把它同步到 $($env:DOWNLOAD_TEST_ORIGIN)/_/harness/desktop/stable/win-x64/ 后，electron-updater 即可拉取。"
+    Write-Host "update feed staged at $feedDir" -ForegroundColor Green
+    Write-Host "sync it to $($env:DOWNLOAD_TEST_ORIGIN)/_/harness/desktop/stable/win-x64/ for electron-updater."
 }
 
 Write-Host ''
-Write-Host "构建完成：$outputRoot" -ForegroundColor Green
+Write-Host "build complete: $outputRoot" -ForegroundColor Green
 Get-ChildItem -LiteralPath $outputRoot -File |
     Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } } |
     Format-Table -AutoSize

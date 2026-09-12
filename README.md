@@ -14,6 +14,7 @@
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
+| PowerShell | 5.1+ | Windows 自带即可，**不需要** PowerShell 7 |
 | Node.js | `^22.19 \|\| >=24` | 建议 24 |
 | pnpm | `11.7.0` | 必须与 harness 的 `packageManager` 一致 |
 | Python | 3.x | **不能是 Microsoft Store 的跳转桩**，原生模块编译需要 |
@@ -45,7 +46,11 @@ $env:DSH_DESKTOP_PRODUCT_NAME = 'DSH Desktop'    # 可选，默认 DeepSeek Harn
 ```
 
 把 `.ico` 放到 `branding/icon.ico` 即可换图标（需含 256×256）。没有图标时构建沿用 Electron 默认图标，
-不会失败。
+不会失败。需要一张临时图标时：
+
+```powershell
+./branding/make-placeholder-icon.ps1 -Text DSH
+```
 
 ## 构建
 
@@ -81,10 +86,10 @@ $env:DSH_DESKTOP_PRODUCT_NAME = 'DSH Desktop'    # 可选，默认 DeepSeek Harn
 签名需要这四个输入，私钥始终留在 USB Token 上：
 
 ```powershell
-$env:DSH_DESKTOP_WINDOWS_CER_FILE    = 'C:\path\to\server.cer'
-$env:DSH_DESKTOP_WINDOWS_SIGNTOOL    = 'C:\path\to\signtool.exe'
+$env:DSH_DESKTOP_WINDOWS_CER_FILE      = 'C:\path\to\server.cer'
+$env:DSH_DESKTOP_WINDOWS_SIGNTOOL      = 'C:\path\to\signtool.exe'
 $env:DSH_DESKTOP_WINDOWS_KEY_CONTAINER = '<SafeNet 私钥容器名>'
-$env:DSH_DESKTOP_WINDOWS_TOKEN_PIN   = '<Token PIN>'   # 不能含 ] 引号 或换行
+$env:DSH_DESKTOP_WINDOWS_TOKEN_PIN     = '<Token PIN>'   # 不能含 ] 引号 或换行
 ```
 
 签名路径还必须指定更新源，否则打包会在写发行记录时失败：
@@ -111,9 +116,9 @@ $env:DOWNLOAD_TEST_ORIGIN = 'https://your-host.example.com'   # 只能是 HTTPS 
 
 ```
 dist/
-  <上游版本>/                    安装包、.blockmap、更新元数据、build-info.json
-    feed/_/harness/desktop/stable/win-x64/    仅签名构建生成
-  last-build.json                最近一次构建的摘要，CI 也读这个文件
+  <上游版本>/                                安装包、.blockmap、更新元数据、build-info.json
+    feed/_/harness/desktop/stable/win-x64/   仅签名构建生成
+  last-build.json                            最近一次构建的摘要，CI 也读这个文件
 ```
 
 `build-info.json` 记录了上游 tag、commit、打包模式、签名判定原因、appId、productName，便于追溯某个
@@ -130,16 +135,16 @@ dist/
 `appId` 上游本来就走环境变量，无需补丁。
 
 上游如果改动了被补丁覆盖的行，`git apply --3way` 会**显式报错并中止**（不会静默产出错误品牌的包）。
-此时：
+此时重新生成补丁：
 
 ```powershell
-# 在 harness/ 中查看冲突
-git -C harness status
-git -C harness diff
-# 修好文件后重新生成补丁
+# 在 harness/ 中手工应用改动后
 git -C harness diff -- apps/desktop/electron-builder.config.mjs > overlay/0001-branding.patch
 git -C harness checkout -- .
 ```
+
+补丁文件受 `.gitattributes` 的 `overlay/*.patch -text` 保护，永远不会被改成 CRLF —— 否则
+`git apply` 的上下文行会匹配失败。
 
 ## 持续跟进
 
@@ -151,13 +156,22 @@ Hosted runner 接触不到 SafeNet Token，所以 **CI 只能产出 unsigned 安
 
 需要在 CI 里固定品牌时，把 `DSH_DESKTOP_APP_ID` / `DSH_DESKTOP_PRODUCT_NAME` 配成仓库 Variables。
 
+## 脚本编码约定
+
+`*.ps1` 里的字符串**全部使用 ASCII**，这是刻意的：Windows PowerShell 5.1 会用系统 ANSI 代码页
+（本机为 936/GBK）读取无 BOM 的文件。中文若以 UTF-8 无 BOM 保存，会被误解码成乱码，全角标点甚至可能
+吞掉紧跟的 `$`，直接破坏脚本语法。中文说明放在 Markdown（`README.md`）里，PowerShell 不会去解析它。
+
+`build.ps1` 写出的 JSON 一律为无 BOM 的 UTF-8，避免严格的 JSON 读取方解析失败。
+
 ## 故障排查
 
 | 现象 | 原因与处理 |
 |---|---|
 | `pnpm install` 卡在 Electron 下载 | 设 `ELECTRON_MIRROR` / `npm_config_registry` |
 | 原生模块编译失败 | Python 是 Store 跳转桩，或缺少 VS C++ Build Tools |
-| `覆盖补丁 ... 应用失败` | 上游改了被覆盖的行，按上一节重新生成补丁 |
+| `overlay patch ... did not apply` | 上游改了被覆盖的行，按"覆盖层维护"重新生成补丁 |
 | `desktop version ... does not match dsh version` | 上游把壳版本和 dsh 版本解绑了；说明设计变了，需要重新评估本仓库 |
 | 签名构建报更新源缺失 | 设置 `DOWNLOAD_TEST_ORIGIN`，或改用 `-Dir` 做本地验证 |
 | `win-x64 requires a Windows x64 build host` | 打包只能在 Windows x64 上跑 |
+| PowerShell 报 `Unexpected token '}'` | 脚本被改成了含中文的无 BOM UTF-8；恢复为 ASCII 或另存为 UTF-8 with BOM |
