@@ -248,6 +248,15 @@ else {
     if ($mode -eq 'unsigned') { $packageArguments += '--unsigned' }
     $packageArguments += '--dir'
 }
+# Upstream package-target.ts re-invokes pnpm as `node $npm_execpath`, so npm_execpath must name a
+# JavaScript file. pnpm 11 installs a platform binary and points npm_execpath at that .exe, which
+# Node rejects with ERR_UNKNOWN_FILE_EXTENSION. pnpm preserves a pre-set npm_execpath, so point it
+# at the JavaScript entry the workspace ships.
+$pnpmEntry = Join-Path $HarnessRoot 'apps\desktop\node_modules\pnpm\bin\pnpm.mjs'
+if (Test-Path -LiteralPath $pnpmEntry) {
+    $env:npm_execpath = $pnpmEntry
+    Write-Host "npm_execpath: $pnpmEntry"
+}
 Invoke-Native -File 'pnpm' -Arguments $packageArguments -WorkingDirectory $HarnessRoot
 
 # ---------------------------------------------------------------------------
