@@ -265,7 +265,32 @@ Write-Host "npm_execpath: $pnpmEntry"
 $packageArguments = @('--import', 'tsx/esm', 'apps/desktop/scripts/package-target.ts', $TargetName)
 if ($mode -eq 'unsigned') { $packageArguments += '--unsigned' }
 if ($Dir) { $packageArguments += '--dir' }
-Invoke-Native -File 'node' -Arguments $packageArguments -WorkingDirectory $HarnessRoot
+
+# electron-builder extracts its NSIS toolchain while it first invokes makensis, and that cold-cache
+# run fails on Windows with a missing output file. Retry only that transient signature.
+$packageLog = Join-Path $BuilderRoot 'package.log'
+$attempt = 1
+while ($true) {
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    Push-Location $HarnessRoot
+    try {
+        & node @packageArguments *>&1 | Tee-Object -FilePath $packageLog
+        $packageExit = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($packageExit -eq 0) { break }
+    $tail = Get-Content -LiteralPath $packageLog -Tail 80 -ErrorAction SilentlyContinue
+    $transient = @($tail | Where-Object { $_ -match 'makensis|open output file|ERR_ELECTRON_BUILDER_CANNOT_EXECUTE' }).Count -gt 0
+    if ($attempt -ge 2 -or -not $transient) {
+        throw "packaging failed (exit $packageExit, attempt $attempt); full output: $packageLog"
+    }
+    $attempt++
+    Write-Warning 'NSIS failed on its first cold-cache run; retrying packaging once'
+}
 
 # ---------------------------------------------------------------------------
 Write-Host '== [6/6] collecting artifacts ==' -ForegroundColor Cyan
