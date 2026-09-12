@@ -213,9 +213,19 @@ Write-Host '== [5/6] packaging (builds the whole repository first; expect 30-60 
 if (-not $NoInstall) {
     Invoke-Native -File 'pnpm' -Arguments @('install', '--frozen-lockfile') -WorkingDirectory $HarnessRoot
 }
-$packageArguments = @('--dir', 'apps/desktop', 'run', 'package', '--', $TargetName)
-if ($mode -eq 'unsigned') { $packageArguments += '--unsigned' }
-if ($Dir) { $packageArguments += '--dir' }
+# Prefer the documented, release-qualified root commands. Only the unpacked unsigned combination
+# has no root script, so that one calls the desktop package script directly.
+if (-not $Dir -and $mode -eq 'unsigned') {
+    $packageArguments = @('run', 'package:desktop:win:x64:unsigned')
+}
+elseif (-not $Dir) {
+    $packageArguments = @('run', 'package:desktop:win:x64')
+}
+else {
+    $packageArguments = @('--filter', '@deepseek-ai/dsh-desktop', 'run', 'package', '--', $TargetName)
+    if ($mode -eq 'unsigned') { $packageArguments += '--unsigned' }
+    $packageArguments += '--dir'
+}
 Invoke-Native -File 'pnpm' -Arguments $packageArguments -WorkingDirectory $HarnessRoot
 
 # ---------------------------------------------------------------------------

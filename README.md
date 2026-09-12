@@ -74,6 +74,10 @@ $env:DSH_DESKTOP_PRODUCT_NAME = 'DSH Desktop'    # 可选，默认 DeepSeek Harn
 一次完整的打包会依次执行仓库构建（`build:official`）、打包 dsh 生产闭包、准备内置 Node.js 和 pnpm、
 裁剪运行时文件、校验完整性，最后交给 electron-builder。首次构建通常需要 30–60 分钟。
 
+打包命令优先复用上游已发布的根命令：签名走 package:desktop:win:x64，未签名走
+package:desktop:win:x64:unsigned。只有 -Dir 组合没有对应的上游根命令，会直接调用
+@deepseek-ai/dsh-desktop 的 package 脚本。
+
 ## 签名与更新
 
 **签名模式不需要手工选择**，`build.ps1` 按四个环境变量自动判定：
