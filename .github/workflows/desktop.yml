@@ -1,0 +1,107 @@
+name: desktop
+
+on:
+  schedule:
+    # 每天 03:00 UTC 探测上游新版本。
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream revision to build (default: newest dsh-v* tag)'
+        required: false
+        type: string
+      channel:
+        description: 'Accepted tag channel'
+        required: false
+        default: any
+        type: choice
+        options: [any, stable]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Hosted runners have no SafeNet token, so CI never sees the four
+      # DSH_DESKTOP_WINDOWS_* inputs and build.ps1 always selects the unsigned path.
+      # Signed releases must be produced on the machine that holds the EV token.
+      - name: Detect upstream version
+        id: detect
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if (-not (Test-Path harness/.git)) {
+            git clone --filter=blob:none https://github.com/deepseek-ai/deepseek-harness.git harness
+          }
+          git -C harness fetch origin --tags --prune --force
+          $ref = '${{ inputs.ref }}'
+          if (-not $ref) {
+            $tags = @(git -C harness tag --list 'dsh-v*' --sort=-v:refname)
+            if ('${{ inputs.channel }}' -eq 'stable') {
+              $tags = @($tags | Where-Object { $_ -match '^dsh-v\d+\.\d+\.\d+$' })
+            }
+            if ($tags.Count -eq 0) { throw 'no dsh-v* tag matched the requested channel' }
+            $ref = $tags[0]
+          }
+          git -C harness checkout --quiet --detach $ref
+          $version = (Get-Content harness/package.json -Raw | ConvertFrom-Json).version
+          "ref=$ref" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          gh release view "dsh-desktop-v$version" *> $null
+          "exists=$($LASTEXITCODE -eq 0)" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer
+        if: steps.detect.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          DSH_DESKTOP_APP_ID: ${{ vars.DSH_DESKTOP_APP_ID }}
+          DSH_DESKTOP_PRODUCT_NAME: ${{ vars.DSH_DESKTOP_PRODUCT_NAME }}
+        run: ./build.ps1 -Ref '${{ steps.detect.outputs.ref }}'
+
+      - name: Publish release
+        if: steps.detect.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $info = Get-Content dist/last-build.json -Raw | ConvertFrom-Json
+          $tag = "dsh-desktop-v$($info.upstreamVersion)"
+          $notes = @(
+            "Upstream dsh $($info.upstreamVersion) ($($info.upstreamCommit))"
+            "Revision: $($info.upstreamRef)"
+            "Mode: $($info.releaseMode)"
+            "App id: $($info.appId)"
+          ) -join "`n"
+          gh release create $tag `
+            --title "$($info.productName) $($info.upstreamVersion)" `
+            --notes $notes `
+            "dist/$($info.upstreamVersion)/*"
+
+      - name: Already released
+        if: steps.detect.outputs.exists == 'true'
+        run: Write-Host "dsh-desktop-v${{ steps.detect.outputs.version }} already published; nothing to do."
+
+      - uses: actions/upload-artifact@v4
+        if: steps.detect.outputs.exists != 'true'
+        with:
+          name: dsh-desktop-win-x64
+          path: dist/
+          retention-days: 14
