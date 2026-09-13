@@ -10,6 +10,23 @@
 取上游修订  →  锚点式品牌覆盖  →  官方打包流程  →  安装包
 ```
 
+## 另一台电脑怎么用
+
+两条独立的路，按目的选一条，不要混：
+
+| 目的 | 做法 | 那台电脑要装什么 |
+|---|---|---|
+| **只想用 DSH Desktop** | 到 [Releases](../../releases) 下载 `deepseek-harness-<版本>-win-x64.exe`，双击安装 | 什么都不用装 |
+| **想自己重新打包** | 装齐下面的[前置条件](#前置条件windows-x64-构建机)，`git clone` 本仓库后跑 `./build.ps1` | Node / pnpm / Python / VS Build Tools，≥ 20 GB 磁盘 |
+
+安装包走 **Release 附件**而不是仓库文件：它 171 MB，而 GitHub 对普通 git 文件有 100 MB 硬限制，塞进仓库根本推不上去。
+
+> 安装包是 **unsigned** 的，Windows SmartScreen 首次会拦一次：点「更多信息 → 仍要运行」。这是没有 EV 代码签名
+> 证书的必然结果，不是包损坏。
+
+装完首次启动要在应用内配置模型凭据（provider 的 API key）。凭据既不在这个仓库里，也不在安装包里，两台电脑
+各自配各自的，互不影响。
+
 ## ⚠️ 默认跟踪 master，不是最新 tag
 
 这是实测踩出来的结论，不是偏好：
@@ -38,15 +55,21 @@ $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'
 $env:npm_config_registry = 'https://registry.npmmirror.com'
 ```
 
-## 一次性初始化
+## 在另一台构建机上开工
 
 ```powershell
-git init
-git remote add origin <你的仓库地址>
+git clone https://github.com/Jasongeng/dsh-desktop-builder.git
+cd dsh-desktop-builder
 ```
 
-`harness/` 和 `dist/` 都已加入 `.gitignore`。`build.ps1` 会在首次运行时自动把上游克隆到 `harness/`，
-不需要手工执行 `git submodule add`。
+`harness/` 和 `dist/` 都在 `.gitignore` 里，所以克隆下来只有 8 个源文件、几百 KB。`build.ps1` 首次运行时会
+自动把上游克隆到 `harness/`，不需要手工执行 `git submodule add`。
+
+要改用你自己的 fork，重指远程即可：
+
+```powershell
+git remote set-url origin <你的仓库地址>
+```
 
 可选的品牌设置：
 
@@ -143,6 +166,22 @@ dist/
 目录名带 commit 短哈希，是因为同一版本号下 master 的不同提交内容并不相同，只按版本号归档会互相覆盖。
 `build-info.json` 记录了上游 ref、commit、打包模式、签名判定原因、appId、productName。
 
+### 把本机构建发到 Release
+
+本机 `build.ps1` 产出的安装包可以直接发成 Release，不需要等 CI 重跑一遍：
+
+```powershell
+$info = Get-Content dist/last-build.json -Raw | ConvertFrom-Json
+$tag = "dsh-desktop-$($info.upstreamVersion)-$($info.upstreamCommit)"
+gh release create $tag `
+  --title "$($info.productName) $($info.upstreamVersion) ($($info.upstreamCommit))" `
+  --notes "Revision: $($info.upstreamRef) / Mode: $($info.releaseMode)" `
+  (Get-ChildItem "$($info.outputRoot)\*" -File).FullName
+```
+
+tag **必须**是 `dsh-desktop-<版本>-<commit>`：`.github/workflows/desktop.yml` 用这个 tag 判断某个组合是否
+已经发布过，命中就直接跳过构建，所以手工发布的产物不会被 CI 重复覆盖。
+
 ## 源码覆盖层
 
 `overlay/apply-overlay.mjs` 是本仓库对上游源码的**全部**改动，共 6 处锚点编辑，作用于 2 个文件：
@@ -213,9 +252,9 @@ Markdown（`README.md`）里，PowerShell 不会去解析它。
 
 | 现象 | 原因与处理 |
 |---|---|
-| `overlay patch ... did not apply` | 旧版补丁机制的错误；本仓库已改成锚点覆盖，请确认用的是 `overlay/apply-branding.mjs` |
+| `overlay patch ... did not apply` | 旧版补丁机制的错误；本仓库已改成锚点覆盖，请确认用的是 `overlay/apply-overlay.mjs` |
 | `revision ... does not support unsigned Windows builds` | 该 tag 早于未签名支持。改用 `-Channel master`，或提供 EV 签名输入 |
-| `anchor "..." matched 0 times` | 上游改动了品牌锚点，更新 `overlay/apply-branding.mjs` |
+| `anchor "..." matched 0 times` | 上游改动了品牌锚点，更新 `overlay/apply-overlay.mjs` |
 | `pnpm install` 卡在 Electron 下载 | 设 `ELECTRON_MIRROR` / `npm_config_registry` |
 | 原生模块编译失败 | Python 是 Store 跳转桩，或缺少 VS C++ Build Tools |
 | `desktop version ... does not match dsh version` | 上游把壳版本和 dsh 版本解绑了；说明设计变了，需要重新评估本仓库 |
