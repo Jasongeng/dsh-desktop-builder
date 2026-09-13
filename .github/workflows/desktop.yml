@@ -72,6 +72,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $info = Get-Content dist/last-build.json -Raw | ConvertFrom-Json
+          # The tag is the coordination point with a release published by hand: both use
+          # dsh-desktop-<version>-<commit>, so a build someone already shipped is never rebuilt here.
           $tag = "dsh-desktop-$($info.upstreamVersion)-$($info.upstreamCommit)"
           $notes = @(
             "Upstream dsh $($info.upstreamVersion) ($($info.upstreamCommit))"
