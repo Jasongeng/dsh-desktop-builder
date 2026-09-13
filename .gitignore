@@ -2,3 +2,18 @@
 /dist/
 /package.log
 /build-full.log
+
+# Credential files must never reach the remote.
+#
+# /harness/ already hides the upstream checkout, and that is where DEEPSEEK_API_KEY would land
+# today. This block exists so the builder root cannot silently gain a .env later: the local
+# Harness credential store is $DSH_HOME/.credentials.yaml, outside this repository, and nothing
+# here should ever become a second copy of it. An API key pushed to a public remote is disclosed
+# the moment it is pushed -- history rewriting cannot un-disclose it.
+.env
+.env.*
+!.env.example
+*.pem
+*.pfx
+*.p12
+*.key
