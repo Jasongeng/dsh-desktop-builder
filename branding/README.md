@@ -1,11 +1,11 @@
 # Branding assets
 
 Everything in this directory is packaging input. It is never written into the harness checkout except the
-icon, which `build.ps1` copies to `harness/apps/desktop/build/icon.ico` before packaging.
+icon, whose absolute path `build.ps1` supplies to the upstream packaging configuration.
 
 | File | Required | Effect |
 |---|---|---|
-| `icon.ico` | no | Application, installer, and uninstaller icon. Without it the stock Electron icon is used. |
+| `icon.ico` | no | Windows application, installer, and uninstaller icon. Without it the upstream icon is used. |
 | `make-placeholder-icon.ps1` | no | Writes a flat-color placeholder `icon.ico` so a branded build can run before final artwork exists. |
 
 ## Icon requirements
@@ -20,5 +20,5 @@ sizes. PNG-compressed entries are valid.
 ```
 
 `build.ps1` exports the icon path as `DSH_DESKTOP_ICON`, which the branding overlay reads from the packaging
-environment. When `branding/icon.ico` is absent the variable is left unset and electron-builder falls back to
-its own default resolution.
+environment. When `branding/icon.ico` is absent the variable is left unset and the upstream Windows icon
+remains selected. In-app artwork and tray icons retain the upstream assets.

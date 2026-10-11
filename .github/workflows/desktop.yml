@@ -33,25 +33,31 @@ jobs:
         with:
           node-version: '24'
 
-      # Hosted runners have no SafeNet token, so CI never sees the four
-      # DSH_DESKTOP_WINDOWS_* inputs and build.ps1 always selects the unsigned path.
-      # Signed releases must be produced on the machine that holds the EV token.
+      - name: Test builder
+        shell: pwsh
+        run: node --test tests/*.test.mjs
+
+      # Hosted builds are explicitly unsigned and manually distributed without a policy service.
       - name: Detect upstream revision
         id: detect
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_REF: ${{ inputs.ref }}
         run: |
           if (-not (Test-Path harness/.git)) {
             git clone --filter=blob:none https://github.com/deepseek-ai/deepseek-harness.git harness
           }
-          git -C harness fetch origin --tags --prune --force
-          $ref = '${{ inputs.ref }}'
+          git -C harness fetch origin --tags --prune
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream fetch failed' }
+          $ref = $env:REQUESTED_REF
           if (-not $ref) { $ref = 'origin/master' }
           git -C harness checkout --quiet --detach $ref
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream checkout failed' }
           $version = (Get-Content harness/package.json -Raw | ConvertFrom-Json).version
-          $commit = git -C harness rev-parse --short HEAD
-          "ref=$ref" >> $env:GITHUB_OUTPUT
+          $fullCommit = git -C harness rev-parse HEAD
+          $commit = $fullCommit.Substring(0, 10)
+          "ref=$fullCommit" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
           "commit=$commit" >> $env:GITHUB_OUTPUT
           gh release view "dsh-desktop-$version-$commit" *> $null
@@ -63,7 +69,8 @@ jobs:
         env:
           DSH_DESKTOP_APP_ID: ${{ vars.DSH_DESKTOP_APP_ID }}
           DSH_DESKTOP_PRODUCT_NAME: ${{ vars.DSH_DESKTOP_PRODUCT_NAME }}
-        run: ./build.ps1 -Ref '${{ steps.detect.outputs.ref }}'
+          UPSTREAM_COMMIT: ${{ steps.detect.outputs.ref }}
+        run: ./build.ps1 -Ref $env:UPSTREAM_COMMIT -Mode unsigned -DisableMandatoryUpdate
 
       - name: Publish release
         if: steps.detect.outputs.exists != 'true'
@@ -74,17 +81,19 @@ jobs:
           $info = Get-Content dist/last-build.json -Raw | ConvertFrom-Json
           # The tag is the coordination point with a release published by hand: both use
           # dsh-desktop-<version>-<commit>, so a build someone already shipped is never rebuilt here.
-          $tag = "dsh-desktop-$($info.upstreamVersion)-$($info.upstreamCommit)"
+          $tag = "dsh-desktop-$($info.upstreamVersion)-$($info.upstreamCommit.Substring(0, 10))"
           $notes = @(
             "Upstream dsh $($info.upstreamVersion) ($($info.upstreamCommit))"
             "Revision: $($info.upstreamRef)"
             "Mode: $($info.releaseMode)"
             "App id: $($info.appId)"
           ) -join "`n"
+          $assets = @(Get-ChildItem -LiteralPath $info.outputRoot -File | Select-Object -ExpandProperty FullName)
           gh release create $tag `
             --title "$($info.productName) $($info.upstreamVersion) ($($info.upstreamCommit))" `
             --notes $notes `
-            "$($info.outputRoot)/*"
+            @assets
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
 
       - name: Already released
         if: steps.detect.outputs.exists == 'true'
@@ -94,5 +103,8 @@ jobs:
         if: steps.detect.outputs.exists != 'true'
         with:
           name: dsh-desktop-win-x64
-          path: dist/
+          path: |
+            dist/*-unsigned/*.exe
+            dist/*-unsigned/*.blockmap
+            dist/*-unsigned/build-info.json
           retention-days: 14

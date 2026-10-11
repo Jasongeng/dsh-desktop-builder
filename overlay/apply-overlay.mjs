@@ -1,91 +1,95 @@
-/**
- * Anchor-based overlay for upstream sources that this builder must adjust.
- *
- * A line-context patch cannot survive upstream refactoring: the lines surrounding the branding
- * keys changed between the dsh-v0.1.5-rc.2 tag and master. Matching anchors instead keeps each
- * edit valid across revisions and fails loudly when an anchor disappears.
- *
- * build.ps1 resets the checkout to the pinned commit before running this, so every edit starts
- * from a pristine file. The `applied` predicate only makes a repeated run on an already overlaid
- * tree a no-op instead of an error.
- */
+/** Apply branding and the explicit local unsigned policy option to an upstream checkout. */
 
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-const CONFIG = 'apps/desktop/electron-builder.config.mjs'
-const SMOKE = 'apps/desktop/tests/fixtures/runtime-payload-smoke.mjs'
+const CONFIG = 'apps/desktop/scripts/electron-builder-config.mjs'
+const ENVIRONMENT = 'apps/desktop/scripts/desktop-package-environment.mjs'
 
 const EDITS = [
   {
     file: CONFIG,
     id: 'productName',
     pattern: /^([ \t]*)productName: 'DeepSeek Harness',$/mu,
+    applied: /^([ \t]*)productName: env\.DSH_DESKTOP_PRODUCT_NAME \?\? 'DeepSeek Harness',$/mu,
     replace: (_match, indent) => `${indent}productName: env.DSH_DESKTOP_PRODUCT_NAME ?? 'DeepSeek Harness',`,
-    applied: text => text.includes('productName: env.DSH_DESKTOP_PRODUCT_NAME'),
   },
   {
     file: CONFIG,
     id: 'win.icon',
-    pattern: /^([ \t]*)win: \{$/mu,
-    replace: (_match, indent) => `${indent}win: {\n${indent}  icon: env.DSH_DESKTOP_ICON,`,
-    applied: text => text.includes('icon: env.DSH_DESKTOP_ICON,'),
+    pattern: /^([ \t]*)icon: (fileURLToPath\(new URL\('\.\.\/resources\/icon-windows\.png', import\.meta\.url\)\)),$/mu,
+    applied: /^([ \t]*)icon: env\.DSH_DESKTOP_ICON \?\? fileURLToPath\(new URL\('\.\.\/resources\/icon-windows\.png', import\.meta\.url\)\),$/mu,
+    replace: (_match, indent, expression) => `${indent}icon: env.DSH_DESKTOP_ICON ?? ${expression},`,
   },
   {
-    // The runtime payload smoke requires fs-ext, which left the dependency graph when the session
-    // write lock moved to @deepseek-ai/node-addon-system/flock. The module is absent from the
-    // lockfile and from every package.json, so prepare:dsh can never satisfy this check.
-    file: SMOKE,
-    id: 'drop-stale-fs-ext-check',
-    pattern: /\/\*\* fs-ext implements[\s\S]*?\n\}\n\n/u,
-    replace: () => '',
-    applied: text => !text.includes('checkFsExt'),
+    file: CONFIG,
+    id: 'win.executableName',
+    pattern: /^([ \t]*)win: \{\n(?![ \t]*executableName:)/mu,
+    applied: /^[ \t]*win: \{\n[ \t]*executableName: 'DeepSeek Harness',$/mu,
+    replace: (_match, indent) => `${indent}win: {\n${indent}  executableName: 'DeepSeek Harness',\n`,
   },
   {
-    file: SMOKE,
-    id: 'drop-stale-fs-ext-call',
-    pattern: /^  checkFsExt\(\)\n/mu,
-    replace: () => '',
-    applied: text => !text.includes('checkFsExt'),
+    file: CONFIG,
+    id: 'local-unsigned-policy',
+    pattern: /^  const policy = resolveDesktopPolicyEnvironment\(env\)$/mu,
+    applied: /^  const policy = env\.DSH_DESKTOP_LOCAL_UNSIGNED === '1' && env\.DSH_DESKTOP_UNSIGNED === '1'/mu,
+    replace: () => "  const policy = env.DSH_DESKTOP_LOCAL_UNSIGNED === '1' && env.DSH_DESKTOP_UNSIGNED === '1'\n    ? undefined : resolveDesktopPolicyEnvironment(env)",
   },
+  ...['SHARED_SETTING', 'AMBIENT_RELEASE_SETTING'].map(name => ({
+    file: ENVIRONMENT,
+    id: `${name}.local-unsigned`,
+    pattern: new RegExp(`^const ${name} = (?!.*LOCAL_UNSIGNED).+$`, 'mu'),
+    applied: new RegExp(`^const ${name} = .*APP_ID\\|LOCAL_UNSIGNED\\|AUTO_UPDATE_ENV.*$`, 'mu'),
+    replace: line => {
+      if (!line.includes('APP_ID|AUTO_UPDATE_ENV')) throw new Error(`overlay: ${name} no longer declares expected release fields`)
+      return line.replace('APP_ID|AUTO_UPDATE_ENV', 'APP_ID|LOCAL_UNSIGNED|AUTO_UPDATE_ENV')
+    },
+  })),
   {
-    file: SMOKE,
-    id: 'drop-stale-fs-ext-report',
-    pattern: /^([ \t]*)fsExt: true, /mu,
-    replace: (_match, indent) => indent,
-    applied: text => !text.includes('fsExt: true'),
-  },
-  {
-    file: SMOKE,
-    id: 'drop-unused-fs-imports',
-    pattern: /^import \{ closeSync, mkdtempSync, openSync, readFileSync, readSync, writeFileSync \} from 'node:fs'$/mu,
-    replace: () => "import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'",
-    applied: text => text.includes("import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'"),
+    file: ENVIRONMENT,
+    id: 'validate-local-unsigned',
+    pattern: /^  resolveDesktopPolicyEnvironment\(environment\)$/mu,
+    applied: /^  const localUnsigned = environment\.DSH_DESKTOP_LOCAL_UNSIGNED === '1'$/mu,
+    replace: () => `  const localUnsigned = environment.DSH_DESKTOP_LOCAL_UNSIGNED === '1'
+  if (environment.DSH_DESKTOP_LOCAL_UNSIGNED !== undefined && !localUnsigned) {
+    throw new Error('desktop package: DSH_DESKTOP_LOCAL_UNSIGNED must be 1 or absent')
+  }
+  if (localUnsigned && options.unsigned !== true) {
+    throw new Error('desktop package: local unsigned policy mode requires --unsigned')
+  }
+  if (!localUnsigned) resolveDesktopPolicyEnvironment(environment)`,
   },
 ]
 
 /**
- * Apply one edit to its file.
+ * Validate every anchor before writing any source file.
  * @param {string} root - Harness checkout root.
- * @param {{ file: string, id: string, pattern: RegExp, replace: Function, applied: Function }} edit - Edit to apply.
- * @returns {string | undefined} The applied edit id, or undefined when it was already in place.
+ * @returns {{ files: Map<string, {content: string, eol: string}>, ids: string[] }} Validated source replacements.
  */
-function applyEdit(root, edit) {
-  const target = resolve(root, edit.file)
-  const original = readFileSync(target, 'utf8')
-  const eol = original.includes('\r\n') ? '\r\n' : '\n'
-  const normalized = original.replace(/\r\n/gu, '\n')
-  if (edit.applied(normalized)) return undefined
-  const matches = [...normalized.matchAll(new RegExp(edit.pattern.source, 'gmu'))]
-  if (matches.length !== 1) {
-    throw new Error(
-      `overlay: ${edit.id} matched ${String(matches.length)} times in ${edit.file}; expected exactly 1. `
-      + 'Upstream changed this file, so the overlay needs a new anchor.',
-    )
+function prepareEdits(root) {
+  const sourceByFile = new Map()
+  const changed = new Map()
+  const ids = []
+  for (const edit of EDITS) {
+    const target = resolve(root, edit.file)
+    let source = sourceByFile.get(target)
+    if (source === undefined) {
+      const original = readFileSync(target, 'utf8')
+      source = { content: original.replace(/\r\n/gu, '\n'), eol: original.includes('\r\n') ? '\r\n' : '\n' }
+      sourceByFile.set(target, source)
+    }
+    const normalized = source.content
+    const matches = [...normalized.matchAll(new RegExp(edit.pattern.source, 'gmu'))]
+    const appliedMatches = [...normalized.matchAll(new RegExp(edit.applied.source, 'gmu'))]
+    if (matches.length === 0 && appliedMatches.length === 1) continue
+    if (matches.length !== 1 || appliedMatches.length !== 0) {
+      throw new Error(`overlay: ${edit.id} matched ${String(matches.length)} source and ${String(appliedMatches.length)} applied anchors in ${edit.file}; expected exactly one source anchor.`)
+    }
+    source.content = normalized.replace(edit.pattern, (...args) => edit.replace(...args))
+    changed.set(target, source)
+    ids.push(edit.id)
   }
-  const next = normalized.replace(edit.pattern, (...args) => edit.replace(...args))
-  writeFileSync(target, eol === '\n' ? next : next.replace(/\n/gu, eol))
-  return edit.id
+  return { files: changed, ids }
 }
 
 const root = process.argv[2]
@@ -94,10 +98,13 @@ if (root === undefined) {
   process.exit(2)
 }
 try {
-  const applied = EDITS.map(edit => applyEdit(resolve(root), edit)).filter(Boolean)
-  console.log(applied.length === 0
+  const pending = prepareEdits(resolve(root))
+  for (const [target, source] of pending.files) {
+    writeFileSync(target, source.eol === '\n' ? source.content : source.content.replace(/\n/gu, source.eol))
+  }
+  console.log(pending.ids.length === 0
     ? 'overlay: already applied'
-    : `overlay: applied ${applied.join(', ')}`)
+    : `overlay: applied ${pending.ids.join(', ')}`)
 }
 catch (error) {
   console.error(error instanceof Error ? error.message : String(error))

@@ -1,337 +1,210 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Build a Windows x64 DeepSeek Harness desktop installer from a tracked upstream revision.
-
+    Build a Windows x64 installer from one pinned upstream DSH revision.
 .DESCRIPTION
-    Checks out one upstream deepseek-harness revision into ./harness, applies the branding overlay,
-    and produces an installer through the official apps/desktop packaging path.
-
-    Signing mode is detected rather than configured. When all four DSH_DESKTOP_WINDOWS_* inputs are
-    present and valid the release is EV-signed and carries electron-updater channel metadata;
-    otherwise an unsigned installer is produced with no update feed.
-
-    Every message is ASCII-only on purpose: Windows PowerShell 5.1 reads a BOM-less file with the
-    ANSI code page, which corrupts non-ASCII string literals and can even change how quotes pair up.
-
+    Prepares file-owned release settings, applies the overlay, and runs official packaging.
+    Local unsigned builds can explicitly omit mandatory updates with -DisableMandatoryUpdate.
 .PARAMETER Ref
-    Upstream git revision (tag, branch, or commit). Overrides -Channel.
-
-.PARAMETER Channel
-    master (default) tracks origin/master. stable picks the newest dsh-v<major>.<minor>.<patch> tag.
-    prerelease picks the newest dsh-v* tag including -rc and -alpha.
-
-    The default is master, not the newest tag, because unsigned Windows packaging needs the
-    DSH_DESKTOP_UNSIGNED support that only landed after the dsh-v0.1.5-rc.2 tag.
-
-.PARAMETER Dir
-    Produce an unpacked application directory instead of an installer.
-
-.PARAMETER Force
-    Rebuild even when the output directory already exists.
-
-.PARAMETER NoInstall
-    Skip pnpm install in the harness checkout.
+    Upstream tag, branch or commit. Overrides Channel.
+.PARAMETER ReleaseConfig
+    Optional dotenv input. Defaults to .env.windows in the builder directory.
+.PARAMETER CheckOnly
+    Prepare the checkout and dependencies, then validate configuration and build tools.
 #>
 [CmdletBinding()]
 param(
     [string]$Ref,
     [ValidateSet('master', 'stable', 'prerelease')][string]$Channel = 'master',
+    [ValidateSet('auto', 'signed', 'unsigned')][string]$Mode = 'auto',
+    [string]$ReleaseConfig,
+    [string]$BuildVersion,
+    [switch]$DisableMandatoryUpdate,
     [switch]$Dir,
     [switch]$Force,
-    [switch]$NoInstall
+    [switch]$NoInstall,
+    [switch]$NoFetch,
+    [switch]$CheckOnly
 )
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-
 $BuilderRoot = $PSScriptRoot
 $HarnessRoot = Join-Path $BuilderRoot 'harness'
-$OverlayRoot = Join-Path $BuilderRoot 'overlay'
 $DistRoot = Join-Path $BuilderRoot 'dist'
-$IconSource = Join-Path $BuilderRoot 'branding\icon.ico'
-$HarnessUrl = 'https://github.com/deepseek-ai/deepseek-harness.git'
 $TargetName = 'win-x64'
-$UnsignedScriptName = 'package:desktop:win:x64:unsigned'
+$HarnessUrl = 'https://github.com/deepseek-ai/deepseek-harness.git'
 
 function Invoke-Native {
-    param(
-        [Parameter(Mandatory = $true)][string]$File,
-        [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [string]$WorkingDirectory = $BuilderRoot
-    )
+    param([string]$File, [string[]]$Arguments, [string]$WorkingDirectory = $BuilderRoot)
     Push-Location $WorkingDirectory
     try {
         & $File @Arguments
-        if ($LASTEXITCODE -ne 0) { throw "$File $($Arguments -join ' ') exited with $LASTEXITCODE" }
+        if ($LASTEXITCODE -ne 0) { throw "$File failed with exit code $LASTEXITCODE" }
     }
     finally { Pop-Location }
 }
-
 function Get-GitOutput {
-    param([Parameter(Mandatory = $true)][string[]]$Arguments)
-    $output = & git -C $HarnessRoot @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') exited with $LASTEXITCODE" }
-    return @($output)
+    param([string[]]$Arguments)
+    $value = & git -C $HarnessRoot @Arguments
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the upstream checkout' }
+    return @($value)
 }
-
-function Get-EnvironmentValue {
-    param([Parameter(Mandatory = $true)][string]$Name)
-    return Get-Item -Path "Env:$Name" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Value
-}
-
-function Test-ScriptExists {
-    param(
-        [Parameter(Mandatory = $true)]$Manifest,
-        [Parameter(Mandatory = $true)][string]$Name
-    )
-    return @($Manifest.scripts.PSObject.Properties | Where-Object { $_.Name -eq $Name }).Count -gt 0
-}
-
-# JSON must be written as UTF-8 without a BOM; a BOM makes strict JSON readers fail.
 function Write-JsonFile {
-    param(
-        [Parameter(Mandatory = $true)]$Value,
-        [Parameter(Mandatory = $true)][string]$Path
-    )
-    $json = $Value | ConvertTo-Json
-    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+    param($Value, [string]$Path)
+    [System.IO.File]::WriteAllText($Path, (($Value | ConvertTo-Json -Depth 10) + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
 
-# ---------------------------------------------------------------------------
 Write-Host '== [1/6] upstream checkout ==' -ForegroundColor Cyan
 if (-not (Test-Path -LiteralPath (Join-Path $HarnessRoot '.git'))) {
-    Write-Host "cloning $HarnessUrl"
-    Invoke-Native -File 'git' -Arguments @('clone', '--filter=blob:none', $HarnessUrl, $HarnessRoot)
+    if ($NoFetch) { throw '-NoFetch requires an existing upstream checkout' }
+    Invoke-Native 'git' @('clone', '--filter=blob:none', $HarnessUrl, $HarnessRoot)
 }
-Invoke-Native -File 'git' -Arguments @('-C', $HarnessRoot, 'fetch', 'origin', '--tags', '--prune', '--force')
-
+if (-not $NoFetch) { Invoke-Native 'git' @('-C', $HarnessRoot, 'fetch', 'origin', '--tags', '--prune') }
 if (-not $Ref) {
-    if ($Channel -eq 'master') {
-        $Ref = 'origin/master'
-    }
+    if ($Channel -eq 'master') { $Ref = 'origin/master' }
     else {
-        $tags = Get-GitOutput -Arguments @('tag', '--list', 'dsh-v*', '--sort=-v:refname')
+        $tags = @(Get-GitOutput @('tag', '--list', 'dsh-v*', '--sort=-v:refname'))
         if ($Channel -eq 'stable') { $tags = @($tags | Where-Object { $_ -match '^dsh-v\d+\.\d+\.\d+$' }) }
-        if ($tags.Count -eq 0) { throw "no dsh-v* tag matched channel '$Channel'" }
+        if ($tags.Count -eq 0) { throw "No upstream release tag matches channel $Channel" }
         $Ref = $tags[0]
     }
 }
-Write-Host "revision: $Ref"
-
-# The overlay dirties the work tree; every build restarts from the pinned commit. Only tracked
-# files are reset -- git clean is deliberately avoided so untracked content is never deleted.
-Invoke-Native -File 'git' -Arguments @('-C', $HarnessRoot, 'reset', '--hard', '--quiet')
-Invoke-Native -File 'git' -Arguments @('-C', $HarnessRoot, 'checkout', '--quiet', '--detach', $Ref)
-
+$commit = (Get-GitOutput @('rev-parse', '--verify', ($Ref + '^{commit}'))) -join ''
+$shortCommit = $commit.Substring(0, 10)
+$previousCommit = (Get-GitOutput @('rev-parse', 'HEAD')) -join ''
+$refreshBuildState = $previousCommit -ne $commit
+# Save known overlay edits before refreshing the build checkout; never clean untracked files.
+$overlayPaths = @(
+    'apps/desktop/electron-builder.config.mjs',
+    'apps/desktop/tests/fixtures/runtime-payload-smoke.mjs',
+    'apps/desktop/scripts/electron-builder-config.mjs',
+    'apps/desktop/scripts/desktop-package-environment.mjs'
+)
+$changed = @(Get-GitOutput @('diff', 'HEAD', '--name-only'))
+if (@($changed | Where-Object { $_ -notin $overlayPaths }).Count -gt 0) {
+    throw 'The build checkout has tracked edits outside the overlay. Preserve them before rebuilding.'
+}
+if ($changed.Count -gt 0) {
+    $backupRoot = Join-Path $DistRoot 'source-backups'
+    New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+    $backup = Join-Path $backupRoot ((Get-Date -Format 'yyyyMMdd-HHmmss') + '.patch')
+    Invoke-Native 'git' @('-C', $HarnessRoot, 'diff', 'HEAD', '--binary', ('--output=' + $backup))
+    foreach ($relative in $changed) {
+        Invoke-Native 'git' @('-C', $HarnessRoot, 'restore', '--source=HEAD', '--staged', '--worktree', '--', $relative)
+    }
+}
+Invoke-Native 'git' @('-C', $HarnessRoot, 'checkout', '--quiet', '--detach', $commit)
 $manifest = Get-Content -LiteralPath (Join-Path $HarnessRoot 'package.json') -Raw | ConvertFrom-Json
 $upstreamVersion = $manifest.version
-$supportsUnsigned = Test-ScriptExists -Manifest $manifest -Name $UnsignedScriptName
-$commit = (Get-GitOutput -Arguments @('rev-parse', '--short', 'HEAD')) -join ''
-Write-Host "upstream dsh version: $upstreamVersion ($commit)"
+if (-not $manifest.scripts.'package:desktop:win:x64:unsigned') { throw 'This upstream revision lacks unsigned desktop packaging' }
+Write-Host "DSH $upstreamVersion ($shortCommit)"
 
-# The upstream version does not change between master commits, so the commit identifies the build.
-$outputRoot = Join-Path $DistRoot "$upstreamVersion-$commit"
-if ((Test-Path -LiteralPath $outputRoot) -and -not $Force) {
-    Write-Host "dist/$upstreamVersion-$commit already exists; pass -Force to rebuild" -ForegroundColor Yellow
+Write-Host '== [2/6] source overlay ==' -ForegroundColor Cyan
+Invoke-Native 'node' @((Join-Path $BuilderRoot 'overlay\apply-overlay.mjs'), $HarnessRoot)
+Write-Host '== [3/6] release configuration ==' -ForegroundColor Cyan
+if (-not $env:DSH_DESKTOP_PRODUCT_NAME) { $env:DSH_DESKTOP_PRODUCT_NAME = 'DSH Desktop' }
+$icon = Join-Path $BuilderRoot 'branding\icon.ico'
+if (Test-Path -LiteralPath $icon) { $env:DSH_DESKTOP_ICON = $icon }
+else { Remove-Item Env:\DSH_DESKTOP_ICON -ErrorAction SilentlyContinue }
+$policyMode = if ($DisableMandatoryUpdate) { 'disabled' } else { 'configured' }
+$configArguments = @((Join-Path $BuilderRoot 'scripts\prepare-config.mjs'), $HarnessRoot, '--mode', $Mode, '--policy', $policyMode)
+if ($ReleaseConfig) { $configArguments += @('--source', (Resolve-Path -LiteralPath $ReleaseConfig).Path) }
+$configJson = & node @configArguments
+if ($LASTEXITCODE -ne 0) { throw 'Release configuration could not be prepared' }
+$config = $configJson | ConvertFrom-Json
+$releaseMode = $config.mode
+Write-Host "Product: $($env:DSH_DESKTOP_PRODUCT_NAME); app id: $($config.appId); mode: $releaseMode; policy: $policyMode"
+$publishedVersion = if ($BuildVersion) { $BuildVersion } else { $upstreamVersion }
+if ($publishedVersion -notmatch '^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$') { throw '-BuildVersion must be an explicit semantic version without build metadata' }
+$suffix = if ($Dir) { '-dir' } else { '' }
+$outputRoot = Join-Path $DistRoot "$publishedVersion-$shortCommit-$releaseMode$suffix"
+if ((Test-Path -LiteralPath (Join-Path $outputRoot 'build-info.json')) -and -not $Force -and -not $CheckOnly) {
+    Write-Host "Completed output exists: $outputRoot. Use -Force to rebuild."
     return
 }
 
-# ---------------------------------------------------------------------------
-Write-Host '== [2/6] source overlay ==' -ForegroundColor Cyan
-$overlayScript = Join-Path $OverlayRoot 'apply-overlay.mjs'
-if (-not (Test-Path -LiteralPath $overlayScript)) { throw "missing overlay script: $overlayScript" }
-Invoke-Native -File 'node' -Arguments @($overlayScript, $HarnessRoot) -WorkingDirectory $HarnessRoot
-
-# ---------------------------------------------------------------------------
-Write-Host '== [3/6] release environment ==' -ForegroundColor Cyan
-if (-not (Get-EnvironmentValue -Name 'DSH_DESKTOP_APP_ID')) {
-    $env:DSH_DESKTOP_APP_ID = 'com.example.dsh-desktop'
-    Write-Warning "DSH_DESKTOP_APP_ID was not set; using $($env:DSH_DESKTOP_APP_ID). Set your own reverse-DNS identifier."
+Write-Host '== [4/6] dependencies and preflight ==' -ForegroundColor Cyan
+if (-not $env:PYTHON -and (Get-Command 'py' -ErrorAction SilentlyContinue)) {
+    $pythonPath = & py -3 -c 'import sys; print(sys.executable)' 2>$null
+    if ($LASTEXITCODE -eq 0 -and $pythonPath -and (Test-Path -LiteralPath $pythonPath)) { $env:PYTHON = $pythonPath }
 }
-if ($env:DSH_DESKTOP_APP_ID -notmatch '^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$') {
-    throw 'DSH_DESKTOP_APP_ID must be a reverse-DNS identifier such as com.yourorg.dsh'
-}
-if (-not (Get-EnvironmentValue -Name 'DSH_DESKTOP_PRODUCT_NAME')) {
-    $env:DSH_DESKTOP_PRODUCT_NAME = 'DeepSeek Harness'
-}
-Write-Host "app id:       $($env:DSH_DESKTOP_APP_ID)"
-Write-Host "product name: $($env:DSH_DESKTOP_PRODUCT_NAME)"
-
-# node-gyp needs a real Python interpreter. On Windows `python` commonly resolves to the Microsoft
-# Store redirector, which cannot run node-gyp, so probe py -3 and export the interpreter it names.
-if (-not (Get-EnvironmentValue -Name 'PYTHON')) {
-    $interpreter = $null
-    if (Get-Command 'py' -ErrorAction SilentlyContinue) {
-        $probe = & py -3 -c "import sys; print(sys.executable)" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $probe) { $interpreter = ($probe | Select-Object -First 1).Trim() }
-    }
-    if ($interpreter -and (Test-Path -LiteralPath $interpreter)) {
-        $env:PYTHON = $interpreter
-        Write-Host "python:       $interpreter"
-    }
-    else {
-        Write-Warning 'No real Python 3 interpreter found. Set PYTHON; native modules will fail to build otherwise.'
-    }
-}
-if ((Get-EnvironmentValue -Name 'PYTHON') -match '\\WindowsApps\\') {
-    Write-Warning 'PYTHON points at the Microsoft Store redirector, which cannot run node-gyp.'
-}
-
-# The icon copied by a previous build is untracked, so it must be removed explicitly; otherwise
-# deleting branding/icon.ico would silently keep the old artwork.
-$iconDir = Join-Path $HarnessRoot 'apps\desktop\build'
-$iconTarget = Join-Path $iconDir 'icon.ico'
-if (Test-Path -LiteralPath $iconTarget) { Remove-Item -LiteralPath $iconTarget -Force }
-
-if (Test-Path -LiteralPath $IconSource) {
-    New-Item -ItemType Directory -Force -Path $iconDir | Out-Null
-    Copy-Item -LiteralPath $IconSource -Destination $iconTarget -Force
-    $env:DSH_DESKTOP_ICON = $iconTarget
-    Write-Host "icon:         $IconSource"
-}
-else {
-    Remove-Item Env:\DSH_DESKTOP_ICON -ErrorAction SilentlyContinue
-    Write-Warning 'branding/icon.ico not found; this build keeps the stock Electron icon.'
-}
-
-# ---------------------------------------------------------------------------
-Write-Host '== [4/6] signing mode ==' -ForegroundColor Cyan
-$signingInputs = @(
-    'DSH_DESKTOP_WINDOWS_CER_FILE',
-    'DSH_DESKTOP_WINDOWS_SIGNTOOL',
-    'DSH_DESKTOP_WINDOWS_KEY_CONTAINER',
-    'DSH_DESKTOP_WINDOWS_TOKEN_PIN'
-)
-$missing = @()
-foreach ($name in $signingInputs) {
-    if ([string]::IsNullOrWhiteSpace((Get-EnvironmentValue -Name $name))) { $missing += $name }
-}
-
-$mode = 'unsigned'
-$signingNote = ''
-if ($missing.Count -gt 0) {
-    $signingNote = "not set: $($missing -join ', ')"
-}
-elseif (-not (Test-Path -LiteralPath $env:DSH_DESKTOP_WINDOWS_CER_FILE)) {
-    $signingNote = "certificate file not found: $($env:DSH_DESKTOP_WINDOWS_CER_FILE)"
-}
-elseif (-not (Test-Path -LiteralPath $env:DSH_DESKTOP_WINDOWS_SIGNTOOL)) {
-    $signingNote = "signtool not found: $($env:DSH_DESKTOP_WINDOWS_SIGNTOOL)"
-}
-elseif ($env:DSH_DESKTOP_WINDOWS_TOKEN_PIN -match '[\]"\r\n]') {
-    $signingNote = 'the token PIN contains a forbidden ], quote, or line break'
-}
-else {
-    $mode = 'signed'
-}
-
-# Unsigned support landed after the dsh-v0.1.5-rc.2 tag; older revisions can only build signed.
-if ($mode -eq 'unsigned' -and -not $supportsUnsigned) {
-    throw "revision '$Ref' does not support unsigned Windows builds (upstream added $UnsignedScriptName later). Use -Channel master, or supply the four DSH_DESKTOP_WINDOWS_* EV signing inputs."
-}
-
-if ($mode -eq 'signed') {
-    if (-not (Get-EnvironmentValue -Name 'DSH_DESKTOP_AUTO_UPDATE_ENV')) {
-        $env:DSH_DESKTOP_AUTO_UPDATE_ENV = 'test'
-    }
-    if ($env:DSH_DESKTOP_AUTO_UPDATE_ENV -eq 'test' -and
-        [string]::IsNullOrWhiteSpace((Get-EnvironmentValue -Name 'DOWNLOAD_TEST_ORIGIN'))) {
-        throw 'A signed release embeds an electron-updater feed. Set DOWNLOAD_TEST_ORIGIN to the HTTPS origin that will host it, or set DSH_DESKTOP_AUTO_UPDATE_ENV=production.'
-    }
-    Write-Host "mode: signed (EV)   update channel: $($env:DSH_DESKTOP_AUTO_UPDATE_ENV)" -ForegroundColor Green
-}
-else {
-    Write-Host "mode: unsigned      reason: $signingNote" -ForegroundColor Yellow
-    Write-Host '      An unsigned installer has no update feed and must be redistributed manually.' -ForegroundColor Yellow
-}
-
-# ---------------------------------------------------------------------------
-Write-Host '== [5/6] packaging (builds the whole repository first; expect 30-60 minutes) ==' -ForegroundColor Cyan
-if (-not $NoInstall) {
-    Invoke-Native -File 'pnpm' -Arguments @('install', '--frozen-lockfile') -WorkingDirectory $HarnessRoot
-}
-# Upstream packages the desktop through apps/desktop/scripts/package-target.ts. Its runPnpm helper
-# re-invokes pnpm as `node $npm_execpath`, and pnpm 11 reports a platform .exe there, which Node
-# rejects with ERR_UNKNOWN_FILE_EXTENSION. The root pnpm scripts restore that .exe value, so launch
-# the packaging entry directly with the workspace's JavaScript pnpm entry exported instead.
+if (-not $NoInstall) { Invoke-Native 'pnpm' @('install', '--frozen-lockfile') $HarnessRoot }
 $pnpmEntry = Join-Path $HarnessRoot 'apps\desktop\node_modules\pnpm\bin\pnpm.mjs'
-if (-not (Test-Path -LiteralPath $pnpmEntry)) {
-    throw "missing the pnpm JavaScript entry: $pnpmEntry"
-}
+if (-not (Test-Path -LiteralPath $pnpmEntry)) { throw 'Missing pnpm JavaScript entry; install upstream dependencies first' }
 $env:npm_execpath = $pnpmEntry
-Write-Host "npm_execpath: $pnpmEntry"
+foreach ($group in @(Get-ChildItem -LiteralPath (Join-Path $HarnessRoot 'packages') -Directory)) {
+    foreach ($package in @(Get-ChildItem -LiteralPath $group.FullName -Directory)) {
+        if (-not (Test-Path -LiteralPath (Join-Path $package.FullName 'package.json'))) { $refreshBuildState = $true }
+    }
+}
 $packageArguments = @('--import', 'tsx/esm', 'apps/desktop/scripts/package-target.ts', $TargetName)
-if ($mode -eq 'unsigned') { $packageArguments += '--unsigned' }
+if ($releaseMode -eq 'unsigned') { $packageArguments += '--unsigned' }
 if ($Dir) { $packageArguments += '--dir' }
+if ($BuildVersion) { $packageArguments += @('--build-version', $BuildVersion) }
+Invoke-Native 'node' ($packageArguments + '--check') $HarnessRoot
+if ($CheckOnly) { return }
 
-# electron-builder extracts its NSIS toolchain while it first invokes makensis, and that cold-cache
-# run fails on Windows with a missing output file. Retry only that transient signature.
+Write-Host '== [5/6] official packaging ==' -ForegroundColor Cyan
+if ($refreshBuildState) {
+    $records = Join-Path $HarnessRoot 'apps\desktop\.desktop-build\packaging-runs'
+    if (Test-Path -LiteralPath $records) {
+        $evidence = Join-Path $DistRoot ('build-evidence\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+        Copy-Item -LiteralPath $records -Destination $evidence -Recurse
+    }
+    Write-Host 'Refreshing generated build state after an upstream change or deleted package'
+    Invoke-Native 'node' @($pnpmEntry, 'run', 'clean') $HarnessRoot
+}
+$targetRoot = [System.IO.Path]::GetFullPath((Join-Path $HarnessRoot 'apps\desktop\.desktop-build\targets\win-x64'))
+$artifactName = if ($releaseMode -eq 'unsigned') { 'unsigned-artifacts' } else { 'artifacts' }
+$previousArtifacts = [System.IO.Path]::GetFullPath((Join-Path $targetRoot $artifactName))
+if (Test-Path -LiteralPath $previousArtifacts) {
+    $artifactBackup = $previousArtifacts + '-previous-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $targetPrefix = $targetRoot.TrimEnd('\') + '\'
+    if (-not $previousArtifacts.StartsWith($targetPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not $artifactBackup.StartsWith($targetPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Artifact paths are outside the selected build target' }
+    Move-Item -LiteralPath $previousArtifacts -Destination $artifactBackup
+}
 $packageLog = Join-Path $BuilderRoot 'package.log'
-$attempt = 1
-while ($true) {
+Push-Location $HarnessRoot
+try {
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    Push-Location $HarnessRoot
-    try {
-        & node @packageArguments *>&1 | Tee-Object -FilePath $packageLog
-        $packageExit = $LASTEXITCODE
-    }
-    finally {
-        Pop-Location
-        $ErrorActionPreference = $previousPreference
-    }
-    if ($packageExit -eq 0) { break }
-    $tail = Get-Content -LiteralPath $packageLog -Tail 80 -ErrorAction SilentlyContinue
-    $transient = @($tail | Where-Object { $_ -match 'makensis|open output file|ERR_ELECTRON_BUILDER_CANNOT_EXECUTE' }).Count -gt 0
-    if ($attempt -ge 2 -or -not $transient) {
-        throw "packaging failed (exit $packageExit, attempt $attempt); full output: $packageLog"
-    }
-    $attempt++
-    Write-Warning 'NSIS failed on its first cold-cache run; retrying packaging once'
+    & node @packageArguments *>&1 | Tee-Object -FilePath $packageLog
+    $packageExit = $LASTEXITCODE
 }
+finally { $ErrorActionPreference = $previousPreference; Pop-Location }
+if ($packageExit -ne 0) { throw "Packaging failed with exit code $packageExit. See $packageLog" }
 
-# ---------------------------------------------------------------------------
-Write-Host '== [6/6] collecting artifacts ==' -ForegroundColor Cyan
-$targetRoot = Join-Path $HarnessRoot "apps\desktop\.desktop-build\targets\$TargetName"
-$artifactDir = if ($mode -eq 'unsigned') { Join-Path $targetRoot 'unsigned-artifacts' } else { Join-Path $targetRoot 'artifacts' }
-if (-not (Test-Path -LiteralPath $artifactDir)) { throw "expected artifacts at $artifactDir but the directory does not exist" }
-
-New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
-Get-ChildItem -LiteralPath $artifactDir -File |
-    Where-Object { $_.Name -notin @('builder-effective-config.yaml', 'builder-debug.yml') } |
-    Copy-Item -Destination $outputRoot -Force
-
+Write-Host '== [6/6] verified artifacts ==' -ForegroundColor Cyan
+if (Test-Path -LiteralPath $outputRoot) {
+    $resolvedOutput = [System.IO.Path]::GetFullPath($outputRoot)
+    $resolvedDist = [System.IO.Path]::GetFullPath($DistRoot).TrimEnd('\') + '\'
+    if (-not $resolvedOutput.StartsWith($resolvedDist, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Output directory is outside dist' }
+    Move-Item -LiteralPath $outputRoot -Destination ($outputRoot + '-previous-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+}
+$collectArguments = @((Join-Path $BuilderRoot 'scripts\collect-artifacts.mjs'), $HarnessRoot, $outputRoot, $releaseMode)
+if ($Dir) { $collectArguments += '--dir' }
+$artifactsJson = & node @collectArguments
+if ($LASTEXITCODE -ne 0) { throw 'Artifact verification or collection failed' }
+$artifacts = $artifactsJson | ConvertFrom-Json
 $info = [ordered]@{
-    upstreamRef     = $Ref
-    upstreamCommit  = $commit
+    upstreamRef = $Ref
+    upstreamCommit = $commit
     upstreamVersion = $upstreamVersion
-    releaseMode     = $mode
-    signingNote     = $signingNote
-    appId           = $env:DSH_DESKTOP_APP_ID
-    productName     = $env:DSH_DESKTOP_PRODUCT_NAME
-    target          = $TargetName
-    directory       = [bool]$Dir
-    outputRoot      = $outputRoot
-    builtAt         = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    buildVersion = $publishedVersion
+    releaseMode = $releaseMode
+    mandatoryUpdate = $policyMode
+    appId = $config.appId
+    productName = $env:DSH_DESKTOP_PRODUCT_NAME
+    target = $TargetName
+    directory = [bool]$Dir
+    outputRoot = $outputRoot
+    artifacts = $artifacts
+    builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 }
-Write-JsonFile -Value $info -Path (Join-Path $outputRoot 'build-info.json')
-Write-JsonFile -Value $info -Path (Join-Path $DistRoot 'last-build.json')
-
-if ($mode -eq 'signed' -and -not $Dir) {
-    $feedDir = Join-Path $outputRoot 'feed\_\harness\desktop\stable\win-x64'
-    New-Item -ItemType Directory -Force -Path $feedDir | Out-Null
-    Get-ChildItem -LiteralPath $outputRoot -File |
-        Where-Object { $_.Extension -in @('.exe', '.yml', '.blockmap') } |
-        Copy-Item -Destination $feedDir -Force
-    Write-Host ''
-    Write-Host "update feed staged at $feedDir" -ForegroundColor Green
-    Write-Host "sync it to $($env:DOWNLOAD_TEST_ORIGIN)/_/harness/desktop/stable/win-x64/ for electron-updater."
-}
-
-Write-Host ''
-Write-Host "build complete: $outputRoot" -ForegroundColor Green
-Get-ChildItem -LiteralPath $outputRoot -File |
-    Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } } |
-    Format-Table -AutoSize
+Write-JsonFile $info (Join-Path $outputRoot 'build-info.json')
+Write-JsonFile $info (Join-Path $DistRoot 'last-build.json')
+Write-Host "Build complete: $outputRoot" -ForegroundColor Green
+Get-ChildItem -LiteralPath $outputRoot -File | Select-Object Name, Length
